@@ -4,16 +4,6 @@ CineScale4K is a Wan2.2-T2V inference sandbox for high-resolution video generati
 
 The current code is centered on `Wan2.2/cinescale.py` and assumes Wan2.2 checkpoints.
 
-## Novelty 🚀
-
-This repo explores high-resolution generation without simply forcing the full 4K token grid through vanilla global self-attention.
-
-- **Prompt-to-high-res restart:** when no input video is provided, the script first generates a normal 720p Wan2.2 latent, upsamples it in latent space, adds noise, and denoises at the requested high resolution.
-- **Video-to-high-res restart:** when an input video is provided, the video can be resized in pixel space or encoded first and resized in latent space before the high-resolution denoising restart.
-- **Block-tiled self-attention:** self-attention can be computed on spatial tiles inside each DiT block, then reassembled before cross-attention and FFN layers. This keeps text cross-attention operating on the full sequence.
-- **Routed global context:** each tile can retrieve relevant same-frame global K/V grids from outside the tile, reducing the “independent tile” failure mode while avoiding full 4K attention cost.
-- **Compressed-relative RoPE for global tokens:** routed global context is RoPE-encoded relative to the tile while keeping coordinates inside the Wan2.2 720p training range.
-- **Joint local/global attention:** local tile tokens and routed global tokens can be concatenated into one attention computation, letting global context compete in the same softmax.
 
 ## Features ✨
 

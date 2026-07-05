@@ -1126,7 +1126,7 @@ if __name__ == "__main__":
     main()
 
 
-# 3840*2160 1920*1088
+# 3840*2160 2560*1440
 
 # python CineScale/Wan2.2/cinescale.py \
 #   --decode_latent CineScale/latent_result.pt \
@@ -1138,7 +1138,7 @@ if __name__ == "__main__":
 # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 # torchrun --standalone --nproc_per_node=4 CineScale/Wan2.2/cinescale.py \
 #   --video CineScale/Eiffel_Tower.mp4 \
-#   --size "2560*1440" \
+#   --size "3840*2160" \
 #   --prompt "The video shows a view of the Eiffel Tower partially obscured by vibrant green foliage. The camera slowly pans upwards, emphasizing the tower's intricate ironwork against a partly cloudy sky." \
 #   --ckpt_dir Wan2.2-T2V-A14B \
 #   --frame_num 41 \

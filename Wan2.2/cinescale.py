@@ -186,6 +186,16 @@ def _tile_starts(length, tile, stride):
     return sorted(set(values))
 
 
+def _vae_decoded_frame_count(latent_frames, temporal_stride=4):
+    return (latent_frames - 1) * temporal_stride + 1
+
+
+def _vae_temporal_keep_range(latent_frames, temporal_pad, temporal_stride=4):
+    start = temporal_pad * temporal_stride
+    end = start + _vae_decoded_frame_count(latent_frames, temporal_stride)
+    return start, end
+
+
 def vae_encode_video_tiled(vae,
                            video,
                            tile_h=1024,
@@ -205,8 +215,9 @@ def vae_encode_video_tiled(vae,
     ) if temporal_pad_frames > 0 else 0
     expected_t = (frames - 1) // temporal_stride + 1
     if temporal_pad_frames > 0:
-        temporal_pad = video[:, :1].repeat(1, temporal_pad_frames, 1, 1)
-        video = torch.cat([temporal_pad, video], dim=1)
+        temporal_pad_start = video[:, :1].repeat(1, temporal_pad_frames, 1, 1)
+        temporal_pad_end = video[:, -1:].repeat(1, temporal_pad_frames, 1, 1)
+        video = torch.cat([temporal_pad_start, video, temporal_pad_end], dim=1)
 
     spatial_stride_h = 8
     spatial_stride_w = 8
@@ -310,6 +321,8 @@ def vae_encode_video_tiled(vae,
     latent = (out_canvas / weight_canvas.clamp_min(1e-6)).float()
     if latent_temporal_crop > 0:
         latent = latent[:, latent_temporal_crop:]
+        if latent.shape[1] > expected_t:
+            latent = latent[:, :expected_t]
     if latent_crop_h > 0:
         latent = latent[:, :, latent_crop_h:-latent_crop_h, :]
     if latent_crop_w > 0:
@@ -708,13 +721,21 @@ def decode_latent_to_video_tiled(vae,
                                  latent,
                                  tile_h=192,
                                  tile_w=192,
-                                 overlap=32):
+                                 overlap=32,
+                                 temporal_pad=4):
     if overlap >= min(tile_h, tile_w):
         raise ValueError("VAE decode tile overlap must be smaller than tile size.")
 
     vae_model = vae.model
     device = vae.device
+    unpadded_latent_frames = latent.shape[1]
+    keep_start, keep_end = _vae_temporal_keep_range(
+        unpadded_latent_frames, temporal_pad)
     z = latent.to(device).unsqueeze(0)
+    if temporal_pad > 0:
+        pad_start = z[:, :, :1].repeat(1, 1, temporal_pad, 1, 1)
+        pad_end = z[:, :, -1:].repeat(1, 1, temporal_pad, 1, 1)
+        z = torch.cat([pad_start, z, pad_end], dim=2)
 
     try:
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=vae.dtype):
@@ -738,167 +759,7 @@ def decode_latent_to_video_tiled(vae,
                 for x0 in xs
             }
             decoded_frames = []
-            total_tiles = frames * len(ys) * len(xs)
-            pbar = tqdm(
-                total=total_tiles,
-                desc="VAE Decode",
-                unit="tile",
-                disable=not is_main_process())
-
-            try:
-                for i in range(frames):
-                    pbar.set_postfix(frame=f"{i + 1}/{frames}")
-                    out_canvas = None
-                    weight_canvas = None
-                    scale_h = None
-                    scale_w = None
-
-                    for y0 in ys:
-                        for x0 in xs:
-                            y1 = min(y0 + tile_h, height)
-                            x1 = min(x0 + tile_w, width)
-                            tile = x[:, :, i:i + 1, y0:y1, x0:x1]
-
-                            tile_cache = tile_caches[(y0, x0)]
-                            vae_model._conv_idx = [0]
-                            tile_out = vae_model.decoder(
-                                tile,
-                                feat_cache=tile_cache,
-                                feat_idx=vae_model._conv_idx).float()
-                            for cache_index, cached in enumerate(tile_cache):
-                                if isinstance(cached, torch.Tensor):
-                                    tile_cache[cache_index] = cached.cpu()
-
-                            _, out_channels, out_t, out_h, out_w = tile_out.shape
-                            if out_canvas is None:
-                                scale_h = out_h / (y1 - y0)
-                                scale_w = out_w / (x1 - x0)
-                                full_h = round(height * scale_h)
-                                full_w = round(width * scale_w)
-                                out_canvas = torch.zeros(
-                                    1,
-                                    out_channels,
-                                    out_t,
-                                    full_h,
-                                    full_w,
-                                    device=device,
-                                    dtype=torch.float32)
-                                weight_canvas = torch.zeros_like(out_canvas)
-
-                            out_y0 = round(y0 * scale_h)
-                            out_x0 = round(x0 * scale_w)
-                            out_y1 = out_y0 + out_h
-                            out_x1 = out_x0 + out_w
-
-                            weight_y = torch.hann_window(
-                                out_h, periodic=False,
-                                device=device).clamp_min(1e-3)
-                            weight_x = torch.hann_window(
-                                out_w, periodic=False,
-                                device=device).clamp_min(1e-3)
-                            weight = (weight_y[:, None] *
-                                      weight_x[None, :]).view(
-                                          1, 1, 1, out_h, out_w)
-
-                            out_canvas[:, :, :, out_y0:out_y1,
-                                       out_x0:out_x1] += tile_out * weight
-                            weight_canvas[:, :, :, out_y0:out_y1,
-                                          out_x0:out_x1] += weight
-
-                            del tile, tile_out, weight
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                            pbar.update(1)
-
-                    out = (out_canvas / weight_canvas.clamp_min(1e-6)).clamp_(
-                        -1, 1).squeeze(0)
-                    decoded_frames.extend(frame.cpu() for frame in out.unbind(1))
-
-                    del out_canvas, weight_canvas, out
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-            finally:
-                pbar.close()
-
-    except torch.OutOfMemoryError:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        if tile_h <= 48 or tile_w <= 48:
-            vae_model.clear_cache()
-            raise
-        logging.warning(
-            "Tiled VAE decode OOM at %dx%d latent tiles. Retrying with %dx%d tiles.",
-            tile_h, tile_w, max(48, tile_h // 2), max(48, tile_w // 2))
-        vae_model.clear_cache()
-        return decode_latent_to_video_tiled(
-            vae,
-            latent,
-            tile_h=max(48, tile_h // 2),
-            tile_w=max(48, tile_w // 2),
-            overlap=min(12, max(0, max(48, tile_h // 2) - 1),
-                        max(0, max(48, tile_w // 2) - 1)))
-    finally:
-        vae_model.clear_cache()
-
-    return torch.stack(decoded_frames, dim=1)
-
-
-def save_latent_video_tiled(vae,
-                            latent,
-                            save_path,
-                            fps,
-                            tile_h=192,
-                            tile_w=192,
-                            overlap=32,
-                            temporal_pad=0):
-    try:
-        import imageio
-    except ImportError as exc:
-        raise ImportError(
-            "Saving videos requires imageio. Install Wan2.2 requirements in "
-            "the active environment, e.g. `pip install -r Wan2.2/requirements.txt`."
-        ) from exc
-
-    if temporal_pad < 0:
-        raise ValueError("--decode_temporal_pad must be non-negative.")
-    if overlap >= min(tile_h, tile_w):
-        raise ValueError("VAE decode tile overlap must be smaller than tile size.")
-
-    vae_model = vae.model
-    device = vae.device
-    z = latent.to(device).unsqueeze(0)
-
-    if temporal_pad > 0:
-        pad = z[:, :, :1].repeat(1, 1, temporal_pad, 1, 1)
-        z = torch.cat([pad, z], dim=2)
-
-    writer = imageio.get_writer(save_path, fps=fps, codec="libx264", quality=8)
-    try:
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=vae.dtype):
-            if isinstance(vae.scale[0], torch.Tensor):
-                z = z / vae.scale[1].view(1, vae_model.z_dim, 1, 1, 1)
-                z = z + vae.scale[0].view(1, vae_model.z_dim, 1, 1, 1)
-            else:
-                z = z / vae.scale[1] + vae.scale[0]
-            x = vae_model.conv2(z)
-
-            _, _, frames, height, width = x.shape
-            stride_h = tile_h - overlap
-            stride_w = tile_w - overlap
-            ys = list(range(0, height, stride_h))
-            xs = list(range(0, width, stride_w))
-            ys[-1] = max(0, height - tile_h)
-            xs[-1] = max(0, width - tile_w)
-            ys = sorted(set(ys))
-            xs = sorted(set(xs))
-
-            vae_model.clear_cache()
-            tile_caches = {
-                (y0, x0): [None] * vae_model._conv_num
-                for y0 in ys
-                for x0 in xs
-            }
-            written_frames = 0
+            decoded_frame_index = 0
             total_tiles = frames * len(ys) * len(xs)
             pbar = tqdm(
                 total=total_tiles,
@@ -974,14 +835,183 @@ def save_latent_video_tiled(vae,
                     out = (out_canvas / weight_canvas.clamp_min(1e-6)).clamp_(
                         -1, 1).squeeze(0)
                     for frame in out.unbind(1):
-                        if written_frames < temporal_pad:
-                            written_frames += 1
+                        if keep_start <= decoded_frame_index < keep_end:
+                            decoded_frames.append(frame.cpu())
+                        decoded_frame_index += 1
+
+                    del out_canvas, weight_canvas, out
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            finally:
+                pbar.close()
+
+    except torch.OutOfMemoryError:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if tile_h <= 48 or tile_w <= 48:
+            vae_model.clear_cache()
+            raise
+        logging.warning(
+            "Tiled VAE decode OOM at %dx%d latent tiles. Retrying with %dx%d tiles.",
+            tile_h, tile_w, max(48, tile_h // 2), max(48, tile_w // 2))
+        vae_model.clear_cache()
+        return decode_latent_to_video_tiled(
+            vae,
+            latent,
+            tile_h=max(48, tile_h // 2),
+            tile_w=max(48, tile_w // 2),
+            overlap=min(12, max(0, max(48, tile_h // 2) - 1),
+                        max(0, max(48, tile_w // 2) - 1)),
+            temporal_pad=temporal_pad)
+    finally:
+        vae_model.clear_cache()
+
+    return torch.stack(decoded_frames, dim=1)
+
+
+def save_latent_video_tiled(vae,
+                            latent,
+                            save_path,
+                            fps,
+                            tile_h=192,
+                            tile_w=192,
+                            overlap=32,
+                            temporal_pad=0):
+    try:
+        import imageio
+    except ImportError as exc:
+        raise ImportError(
+            "Saving videos requires imageio. Install Wan2.2 requirements in "
+            "the active environment, e.g. `pip install -r Wan2.2/requirements.txt`."
+        ) from exc
+
+    if temporal_pad < 0:
+        raise ValueError("--decode_temporal_pad must be non-negative.")
+    if overlap >= min(tile_h, tile_w):
+        raise ValueError("VAE decode tile overlap must be smaller than tile size.")
+
+    vae_model = vae.model
+    device = vae.device
+    unpadded_latent_frames = latent.shape[1]
+    keep_start, keep_end = _vae_temporal_keep_range(
+        unpadded_latent_frames, temporal_pad)
+    z = latent.to(device).unsqueeze(0)
+
+    if temporal_pad > 0:
+        pad_start = z[:, :, :1].repeat(1, 1, temporal_pad, 1, 1)
+        pad_end = z[:, :, -1:].repeat(1, 1, temporal_pad, 1, 1)
+        z = torch.cat([pad_start, z, pad_end], dim=2)
+
+    writer = imageio.get_writer(save_path, fps=fps, codec="libx264", quality=8)
+    try:
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=vae.dtype):
+            if isinstance(vae.scale[0], torch.Tensor):
+                z = z / vae.scale[1].view(1, vae_model.z_dim, 1, 1, 1)
+                z = z + vae.scale[0].view(1, vae_model.z_dim, 1, 1, 1)
+            else:
+                z = z / vae.scale[1] + vae.scale[0]
+            x = vae_model.conv2(z)
+
+            _, _, frames, height, width = x.shape
+            stride_h = tile_h - overlap
+            stride_w = tile_w - overlap
+            ys = list(range(0, height, stride_h))
+            xs = list(range(0, width, stride_w))
+            ys[-1] = max(0, height - tile_h)
+            xs[-1] = max(0, width - tile_w)
+            ys = sorted(set(ys))
+            xs = sorted(set(xs))
+
+            vae_model.clear_cache()
+            tile_caches = {
+                (y0, x0): [None] * vae_model._conv_num
+                for y0 in ys
+                for x0 in xs
+            }
+            decoded_frame_index = 0
+            total_tiles = frames * len(ys) * len(xs)
+            pbar = tqdm(
+                total=total_tiles,
+                desc="VAE Decode",
+                unit="tile",
+                disable=not is_main_process())
+
+            try:
+                for i in range(frames):
+                    pbar.set_postfix(frame=f"{i + 1}/{frames}")
+                    out_canvas = None
+                    weight_canvas = None
+                    scale_h = None
+                    scale_w = None
+
+                    for y0 in ys:
+                        for x0 in xs:
+                            y1 = min(y0 + tile_h, height)
+                            x1 = min(x0 + tile_w, width)
+                            tile = x[:, :, i:i + 1, y0:y1, x0:x1]
+
+                            tile_cache = tile_caches[(y0, x0)]
+                            vae_model._conv_idx = [0]
+                            tile_out = vae_model.decoder(
+                                tile,
+                                feat_cache=tile_cache,
+                                feat_idx=vae_model._conv_idx).float()
+                            for cache_index, cached in enumerate(tile_cache):
+                                if isinstance(cached, torch.Tensor):
+                                    tile_cache[cache_index] = cached.cpu()
+
+                            _, out_channels, out_t, out_h, out_w = tile_out.shape
+                            if out_canvas is None:
+                                scale_h = out_h / (y1 - y0)
+                                scale_w = out_w / (x1 - x0)
+                                full_h = round(height * scale_h)
+                                full_w = round(width * scale_w)
+                                out_canvas = torch.zeros(
+                                    1,
+                                    out_channels,
+                                    out_t,
+                                    full_h,
+                                    full_w,
+                                    device=device,
+                                    dtype=torch.float32)
+                                weight_canvas = torch.zeros_like(out_canvas)
+
+                            out_y0 = round(y0 * scale_h)
+                            out_x0 = round(x0 * scale_w)
+                            out_y1 = out_y0 + out_h
+                            out_x1 = out_x0 + out_w
+
+                            weight_y = torch.hann_window(
+                                out_h, periodic=False,
+                                device=device).clamp_min(1e-3)
+                            weight_x = torch.hann_window(
+                                out_w, periodic=False,
+                                device=device).clamp_min(1e-3)
+                            weight = (weight_y[:, None] *
+                                      weight_x[None, :]).view(
+                                          1, 1, 1, out_h, out_w)
+
+                            out_canvas[:, :, :, out_y0:out_y1,
+                                       out_x0:out_x1] += tile_out * weight
+                            weight_canvas[:, :, :, out_y0:out_y1,
+                                          out_x0:out_x1] += weight
+
+                            del tile, tile_out, weight
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            pbar.update(1)
+
+                    out = (out_canvas / weight_canvas.clamp_min(1e-6)).clamp_(
+                        -1, 1).squeeze(0)
+                    for frame in out.unbind(1):
+                        should_write = keep_start <= decoded_frame_index < keep_end
+                        decoded_frame_index += 1
+                        if not should_write:
                             continue
                         frame = ((frame + 1.0) * 127.5).clamp_(0, 255)
                         frame = frame.to(torch.uint8).permute(
                             1, 2, 0).cpu().numpy()
                         writer.append_data(frame)
-                        written_frames += 1
 
                     del out_canvas, weight_canvas, out
                     if torch.cuda.is_available():
@@ -1018,37 +1048,46 @@ def save_latent_video_tiled(vae,
 
 def save_latent_video_streaming_full_frame(vae,
                                            latent,
-                                           save_path,
-                                           fps,
+                                           save_path=None,
+                                           fps=16,
                                            temporal_pad=0):
-    try:
-        import imageio
-    except ImportError as exc:
-        raise ImportError(
-            "Saving videos requires imageio. Install Wan2.2 requirements in "
-            "the active environment, e.g. `pip install -r Wan2.2/requirements.txt`."
-        ) from exc
+    writer = None
+    if save_path is not None:
+        try:
+            import imageio
+        except ImportError as exc:
+            raise ImportError(
+                "Saving videos requires imageio. Install Wan2.2 requirements in "
+                "the active environment, e.g. `pip install -r Wan2.2/requirements.txt`."
+            ) from exc
 
     vae_model = vae.model
     z = latent.to(vae.device)
+    unpadded_latent_frames = latent.shape[1]
+    keep_start, keep_end = _vae_temporal_keep_range(
+        unpadded_latent_frames, temporal_pad)
     if temporal_pad < 0:
         raise ValueError("--decode_temporal_pad must be non-negative.")
-    writer = imageio.get_writer(save_path, fps=fps, codec="libx264", quality=8)
+    if save_path is not None:
+        writer = imageio.get_writer(save_path, fps=fps, codec="libx264", quality=8)
+    decoded_frames = []
     try:
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=vae.dtype):
             vae_model.clear_cache()
             z = z.unsqueeze(0)
             if temporal_pad > 0:
-                pad = z[:, :, :1].repeat(1, 1, temporal_pad, 1, 1)
-                z = torch.cat([pad, z], dim=2)
+                pad_start = z[:, :, :1].repeat(1, 1, temporal_pad, 1, 1)
+                pad_end = z[:, :, -1:].repeat(1, 1, temporal_pad, 1, 1)
+                z = torch.cat([pad_start, z, pad_end], dim=2)
             if isinstance(vae.scale[0], torch.Tensor):
                 z = z / vae.scale[1].view(1, vae_model.z_dim, 1, 1, 1)
                 z = z + vae.scale[0].view(1, vae_model.z_dim, 1, 1, 1)
             else:
                 z = z / vae.scale[1] + vae.scale[0]
             x = vae_model.conv2(z)
-            written_frames = 0
-            for i in range(x.shape[2]):
+            decoded_frame_index = 0
+            decode_frames = x.shape[2]
+            for i in range(decode_frames):
                 vae_model._conv_idx = [0]
                 out = vae_model.decoder(
                     x[:, :, i:i + 1, :, :],
@@ -1056,18 +1095,27 @@ def save_latent_video_streaming_full_frame(vae,
                     feat_idx=vae_model._conv_idx)
                 out = out.float().clamp_(-1, 1).squeeze(0)
                 for frame in out.unbind(1):
-                    if written_frames < temporal_pad:
-                        written_frames += 1
+                    should_write = keep_start <= decoded_frame_index < keep_end
+                    decoded_frame_index += 1
+                    if not should_write:
                         continue
-                    frame = ((frame + 1.0) * 127.5).clamp_(0, 255)
-                    frame = frame.to(torch.uint8).permute(1, 2, 0).cpu().numpy()
-                    writer.append_data(frame)
-                    written_frames += 1
+                    frame = frame.detach().float().cpu()
+                    decoded_frames.append(frame)
+                    if writer is not None:
+                        frame_np = ((frame + 1.0) * 127.5).clamp_(0, 255)
+                        frame_np = frame_np.to(torch.uint8).permute(
+                            1, 2, 0).numpy()
+                        writer.append_data(frame_np)
                 del out
                 torch.cuda.empty_cache()
     finally:
-        writer.close()
+        if writer is not None:
+            writer.close()
         vae_model.clear_cache()
+
+    if decoded_frames:
+        return torch.stack(decoded_frames, dim=1)
+    return torch.empty(0)
 
 
 def load_latent_payload(path):
@@ -1141,6 +1189,7 @@ def run(args, model, cfg):
     timesteps, sigmas = make_scheduler(model, sample_steps,
                                                     sample_shift)
 
+    prompt_base_latent_cpu = None
     if args.video is None:
         prompt_base_size = "1280*720"
         base_latent, base_seq_len, _ = create_prompt_noise_latent(
@@ -1175,6 +1224,8 @@ def run(args, model, cfg):
             guide_scale=guide_scale,
             offload_model=step_offload_model,
             y=None)
+        if args.save_latent is not None and is_main_process():
+            prompt_base_latent_cpu = base_latent.detach().cpu()
 
         if args.video_resize_mode == "latent":
             clean_latent, resize_metadata = resize_latent_to_size(
@@ -1191,7 +1242,10 @@ def run(args, model, cfg):
             if args.offload_model:
                 offload_dit_models(model)
                 model.vae.model.to(device=model.vae.device, dtype=model.vae.dtype)
-            base_video = decode_latent_to_video_tiled(model.vae, base_latent)
+            base_video = save_latent_video_streaming_full_frame(
+                model.vae,
+                base_latent,
+                temporal_pad=args.decode_temporal_pad)
             target_width, target_height = parse_size(encode_size)
             target_lat_h, target_lat_w = best_latent_size(
                 target_width, target_height, target_width * target_height,
@@ -1309,7 +1363,11 @@ def run(args, model, cfg):
     }
 
     restart_metadata = []
+    restart_latents = []
     final_latent = clean_latent.detach()
+    initial_latent_cpu = (
+        final_latent.detach().cpu()
+        if args.save_latent is not None and is_main_process() else None)
     with no_sync_low(), no_sync_high():
         for restart_idx in range(args.noise_rounds):
             if is_main_process():
@@ -1334,15 +1392,30 @@ def run(args, model, cfg):
                 "start_index": start_index,
                 "start_sigma": float(sigmas[start_index].detach().cpu()),
             })
+            if args.save_latent is not None and is_main_process():
+                restart_latents.append({
+                    "round": restart_idx + 1,
+                    "latent": final_latent.detach().cpu(),
+                    "start_index": start_index,
+                    "start_sigma": float(sigmas[start_index].detach().cpu()),
+                })
     if args.offload_model:  
         offload_dit_models(model)
 
     if args.save_latent is not None and is_main_process():
         payload = {
             "final_latent": final_latent.detach().cpu(),
+            "initial_latent": initial_latent_cpu,
+            "prompt_base_latent": prompt_base_latent_cpu,
+            "round_latents": restart_latents,
             "metadata": {
                 **latent_metadata,
                 "latent_shape": tuple(final_latent.shape),
+                "initial_latent_shape": (
+                    tuple(initial_latent_cpu.shape)
+                    if initial_latent_cpu is not None else None),
+                "prompt_base_latent_saved": (
+                    prompt_base_latent_cpu is not None),
                 "start_index": start_index,
                 "start_sigma": float(sigmas[start_index].detach().cpu()),
                 "noise_restarts": restart_metadata,
@@ -1393,8 +1466,8 @@ def parse_args():
     parser.add_argument(
         "--decode_temporal_pad",
         type=int,
-        default=0,
-        help="Duplicate this many first latent slices before VAE decode and skip their decoded frames.")
+        default=4,
+        help="Duplicate this many first and last latent slices before VAE decode, then skip the padded decoded boundary frames.")
     parser.add_argument("--fps", type=int, default=16)
     parser.add_argument(
         "--size",
@@ -1596,11 +1669,11 @@ if __name__ == "__main__":
 # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 # torchrun --standalone --nproc_per_node=4 CineScale/Wan2.2/cinescale.py \
 #   --size "3840*2160" \
-#   --prompt "A tiny astronaut walking across the surface of a giant orange, macro photography, shallow depth of field." \
+#   --prompt "The camera zooms toward a tiny astronaut walking inside a snow globe, macro photography." \
 #   --ckpt_dir Wan2.2-T2V-A14B \
-#   --frame_num 17 \
+#   --frame_num 21 \
 #  --video_resize_mode pixel \
-#   --round_noise_steps 20 \
+#   --round_noise_steps 15 \
 #   --sample_shift 12 \
 #   --block_tiled_self_attn true \
 #   --block_tiled_self_attn_tile_height 24 \
@@ -1613,7 +1686,7 @@ if __name__ == "__main__":
 # --block_tiled_self_attn_global_attention_mode joint \
 # --block_tiled_self_attn_global_rope_threshold 40 \
 #   --save_latent CineScale/latent_result.pt \
-# --decode_temporal_pad 4 \
+# --decode_temporal_pad 0 \
 # --noise_rounds 2 \
 #   --ulysses_size 4 \
 #   --dit_fsdp \

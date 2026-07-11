@@ -366,11 +366,15 @@ def make_scheduler(model, sample_steps, shift):
     sampling_sigmas = get_sampling_sigmas(sample_steps, shift)
     timesteps, _ = retrieve_timesteps(
         scheduler, device=model.device, sigmas=sampling_sigmas)
-    return timesteps, scheduler.sigmas.to(model.device)
+    scheduler.sigmas = scheduler.sigmas.to(model.device)
+    return scheduler, timesteps, scheduler.sigmas
 
 
-def flow_euler_step(latent, flow, sigma_from, sigma_to):
-    return latent + (sigma_to - sigma_from) * flow
+def reset_scheduler_state(scheduler):
+    scheduler._step_index = None
+    scheduler._begin_index = None
+    scheduler.lower_order_nums = 0
+    scheduler.model_outputs = [None] * scheduler.config.solver_order
 
 
 def set_self_attention_scale(model, scale):
@@ -410,6 +414,9 @@ def set_block_tiled_self_attention(model, enabled, tile_height, tile_width,
                                    routed_topk, routed_grid,
                                    global_attention_mode,
                                    global_rope_threshold,
+                                   adaptive_rectified_rope,
+                                   full_attention_rectified_rope,
+                                   block_tiled_full_global,
                                    block_range):
     if enabled and min(tile_height, tile_width, stride_height, stride_width) <= 0:
         raise ValueError(
@@ -450,6 +457,12 @@ def set_block_tiled_self_attention(model, enabled, tile_height, tile_width,
                 global_attention_mode)
             block.self_attn.block_tiled_attn_global_rope_threshold = (
                 global_rope_threshold)
+            block.self_attn.block_tiled_attn_adaptive_rectified_rope = (
+                adaptive_rectified_rope)
+            block.self_attn.full_attn_rectified_rope = (
+                full_attention_rectified_rope)
+            block.self_attn.block_tiled_attn_full_global = (
+                block_tiled_full_global)
 
     for _, dit_model in unique_dit_models(model):
         set_model_block_tiling(dit_model)
@@ -634,6 +647,7 @@ def denoise(model,
             context,
             context_null,
             seq_len,
+            scheduler,
             timesteps,
             sigmas,
             sample_steps,
@@ -660,6 +674,7 @@ def denoise(model,
         context=context,
         context_null=context_null,
         seq_len=seq_len,
+        scheduler=scheduler,
         timesteps=timesteps,
         sigmas=sigmas,
         sample_steps=sample_steps,
@@ -676,6 +691,7 @@ def denoise_trajectory(model,
                        context,
                        context_null,
                        seq_len,
+                       scheduler,
                        timesteps,
                        sigmas,
                        sample_steps,
@@ -686,6 +702,7 @@ def denoise_trajectory(model,
                        y=None):
     boundary = model.boundary * model.num_train_timesteps
     latent = start_latent.detach()
+    reset_scheduler_state(scheduler)
 
     for i in tqdm(
             range(start_index, sample_steps),
@@ -706,8 +723,11 @@ def denoise_trajectory(model,
                 boundary,
                 offload_model,
                 y=y)
-            latent = flow_euler_step(latent, flow, sigmas[i],
-                                     sigmas[i + 1]).detach()
+            latent = scheduler.step(
+                flow.unsqueeze(0),
+                timesteps[i],
+                latent.unsqueeze(0),
+                return_dict=False)[0].squeeze(0).detach()
 
     return latent, flow
 
@@ -715,6 +735,36 @@ def denoise_trajectory(model,
 def save_latent_video_streaming(vae, latent, save_path, fps, temporal_pad=0):
     return save_latent_video_tiled(vae, latent, save_path, fps,
                                    temporal_pad=temporal_pad)
+
+
+def save_video_tensor(video, save_path, fps):
+    try:
+        import imageio
+    except ImportError as exc:
+        raise ImportError(
+            "Saving videos requires imageio. Install Wan2.2 requirements in "
+            "the active environment, e.g. `pip install -r Wan2.2/requirements.txt`."
+        ) from exc
+
+    writer = imageio.get_writer(save_path, fps=fps, codec="libx264", quality=8)
+    try:
+        for frame in video.unbind(1):
+            frame = ((frame.float() + 1.0) * 127.5).clamp_(0, 255)
+            frame = frame.to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+            writer.append_data(frame)
+    finally:
+        writer.close()
+
+
+def decode_latent_wan(vae, latent):
+    with torch.no_grad():
+        return vae.decode([latent.to(vae.device)])[0]
+
+
+def save_latent_video_wan_decode(vae, latent, save_path, fps):
+    video = decode_latent_wan(vae, latent)
+    save_video_tensor(video, save_path, fps)
+    return video
 
 
 def decode_latent_to_video_tiled(vae,
@@ -1045,87 +1095,51 @@ def save_latent_video_tiled(vae,
         writer.close()
         vae_model.clear_cache()
 
-
-def save_latent_video_streaming_full_frame(vae,
-                                           latent,
-                                           save_path=None,
-                                           fps=16,
-                                           temporal_pad=0):
-    writer = None
-    if save_path is not None:
-        try:
-            import imageio
-        except ImportError as exc:
-            raise ImportError(
-                "Saving videos requires imageio. Install Wan2.2 requirements in "
-                "the active environment, e.g. `pip install -r Wan2.2/requirements.txt`."
-            ) from exc
-
-    vae_model = vae.model
-    z = latent.to(vae.device)
-    unpadded_latent_frames = latent.shape[1]
-    keep_start, keep_end = _vae_temporal_keep_range(
-        unpadded_latent_frames, temporal_pad)
-    if temporal_pad < 0:
-        raise ValueError("--decode_temporal_pad must be non-negative.")
-    if save_path is not None:
-        writer = imageio.get_writer(save_path, fps=fps, codec="libx264", quality=8)
-    decoded_frames = []
-    try:
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=vae.dtype):
-            vae_model.clear_cache()
-            z = z.unsqueeze(0)
-            if temporal_pad > 0:
-                pad_start = z[:, :, :1].repeat(1, 1, temporal_pad, 1, 1)
-                pad_end = z[:, :, -1:].repeat(1, 1, temporal_pad, 1, 1)
-                z = torch.cat([pad_start, z, pad_end], dim=2)
-            if isinstance(vae.scale[0], torch.Tensor):
-                z = z / vae.scale[1].view(1, vae_model.z_dim, 1, 1, 1)
-                z = z + vae.scale[0].view(1, vae_model.z_dim, 1, 1, 1)
-            else:
-                z = z / vae.scale[1] + vae.scale[0]
-            x = vae_model.conv2(z)
-            decoded_frame_index = 0
-            decode_frames = x.shape[2]
-            for i in range(decode_frames):
-                vae_model._conv_idx = [0]
-                out = vae_model.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=vae_model._feat_map,
-                    feat_idx=vae_model._conv_idx)
-                out = out.float().clamp_(-1, 1).squeeze(0)
-                for frame in out.unbind(1):
-                    should_write = keep_start <= decoded_frame_index < keep_end
-                    decoded_frame_index += 1
-                    if not should_write:
-                        continue
-                    frame = frame.detach().float().cpu()
-                    decoded_frames.append(frame)
-                    if writer is not None:
-                        frame_np = ((frame + 1.0) * 127.5).clamp_(0, 255)
-                        frame_np = frame_np.to(torch.uint8).permute(
-                            1, 2, 0).numpy()
-                        writer.append_data(frame_np)
-                del out
-                torch.cuda.empty_cache()
-    finally:
-        if writer is not None:
-            writer.close()
-        vae_model.clear_cache()
-
-    if decoded_frames:
-        return torch.stack(decoded_frames, dim=1)
-    return torch.empty(0)
-
-
-def load_latent_payload(path):
+def load_latent_payload(path, latent_key="final_latent"):
     payload = torch.load(path, map_location="cpu")
     if isinstance(payload, torch.Tensor):
+        if latent_key not in ("tensor", "final_latent"):
+            raise KeyError(
+                f"{path} is a raw tensor, so --decode_latent_key must be 'tensor' or 'final_latent'.")
         return payload, {}
+    metadata = dict(payload.get("metadata", {}))
+
+    if latent_key.startswith("round_latents:"):
+        round_id = int(latent_key.split(":", 1)[1])
+        for item in payload.get("round_latents", []):
+            if item.get("round") == round_id:
+                metadata["decoded_latent_key"] = latent_key
+                metadata["decoded_round"] = round_id
+                return item["latent"], metadata
+        raise KeyError(
+            f"{path} does not contain round_latents entry for round {round_id}.")
+
+    if latent_key == "round_latents":
+        round_latents = payload.get("round_latents", [])
+        if not round_latents:
+            raise KeyError(f"{path} does not contain any round_latents.")
+        item = round_latents[-1]
+        metadata["decoded_latent_key"] = latent_key
+        metadata["decoded_round"] = item.get("round")
+        return item["latent"], metadata
+
+    if latent_key in payload:
+        latent = payload[latent_key]
+        if latent is None:
+            raise KeyError(f"{path} contains '{latent_key}', but it is None.")
+        metadata["decoded_latent_key"] = latent_key
+        return latent, metadata
+
+    if latent_key != "final_latent":
+        available = sorted(k for k in payload.keys() if k != "metadata")
+        raise KeyError(
+            f"{path} does not contain '{latent_key}'. Available latent keys: {available}")
     if "final_latent" in payload:
-        return payload["final_latent"], payload.get("metadata", {})
+        metadata["decoded_latent_key"] = "final_latent"
+        return payload["final_latent"], metadata
     if "clean_latent" in payload:
-        return payload["clean_latent"], payload.get("metadata", {})
+        metadata["decoded_latent_key"] = "clean_latent"
+        return payload["clean_latent"], metadata
     raise KeyError(
         f"{path} must contain a tensor, 'final_latent', or 'clean_latent'.")
 
@@ -1143,7 +1157,8 @@ def decode_latent_only(args, cfg):
 
     from wan.modules.vae2_1 import Wan2_1_VAE
 
-    latent, metadata = load_latent_payload(args.decode_latent)
+    latent, metadata = load_latent_payload(args.decode_latent,
+                                           args.decode_latent_key)
     fps = metadata.get("fps", args.fps)
     vae_dtype = parse_torch_dtype(args.vae_dtype)
     vae = Wan2_1_VAE(
@@ -1151,9 +1166,14 @@ def decode_latent_only(args, cfg):
         dtype=vae_dtype,
         device=torch.device(f"cuda:{local_rank}"))
     set_vae_dtype(vae, vae_dtype)
-    save_latent_video_streaming(vae, latent, args.save_video, fps,
-                                args.decode_temporal_pad)
-    logging.info("Decoded %s to %s", args.decode_latent, args.save_video)
+    if metadata.get("decoded_latent_key") == "prompt_base_latent":
+        save_latent_video_wan_decode(vae, latent, args.save_video, fps)
+    else:
+        save_latent_video_streaming(vae, latent, args.save_video, fps,
+                                    args.decode_temporal_pad)
+    logging.info("Decoded %s:%s to %s", args.decode_latent,
+                 metadata.get("decoded_latent_key", args.decode_latent_key),
+                 args.save_video)
 
 
 def run(args, model, cfg):
@@ -1176,6 +1196,12 @@ def run(args, model, cfg):
         raise ValueError("--frame_num must be 4n+1 for Wan T2V.")
     if args.noise_rounds < 1:
         raise ValueError("--noise_rounds must be at least 1.")
+    if args.target_noise_init and args.video is not None:
+        raise ValueError(
+            "--target_noise_init is prompt-only; do not pass --video.")
+    if args.target_noise_init and args.baseline_wan:
+        raise ValueError(
+            "--target_noise_init and --baseline_wan are mutually exclusive.")
 
     if args.offload_model and args.video is not None:
         offload_dit_models(model)
@@ -1186,8 +1212,212 @@ def run(args, model, cfg):
     context, context_null = prepare_text_context(model, args.prompt,
                                                      args.negative_prompt,
                                                      text_offload_model)
-    timesteps, sigmas = make_scheduler(model, sample_steps,
-                                                    sample_shift)
+    scheduler, timesteps, sigmas = make_scheduler(model, sample_steps,
+                                                  sample_shift)
+
+    def configure_block_tiled_attention(enabled):
+        effective_enabled = enabled and not args.full_video_attention
+        set_block_tiled_self_attention(
+            model,
+            effective_enabled,
+            args.block_tiled_self_attn_tile_height,
+            args.block_tiled_self_attn_tile_width,
+            args.block_tiled_self_attn_stride_height,
+            args.block_tiled_self_attn_stride_width,
+            args.block_tiled_self_attn_halo,
+            args.block_tiled_self_attn_routed_topk,
+            args.block_tiled_self_attn_routed_grid,
+            args.block_tiled_self_attn_global_attention_mode,
+            args.block_tiled_self_attn_global_rope_threshold,
+            args.adaptive_rectified_ntk_rope,
+            args.full_attention_rectified_rope,
+            args.block_tiled_self_attn_full_global,
+            args.block_tiled_self_attn_blocks)
+
+    if args.baseline_wan:
+        if args.video is not None:
+            raise ValueError(
+                "--baseline_wan is prompt-only; do not pass --video.")
+        base_latent, seq_len, metadata = create_prompt_noise_latent(
+            model, encode_size, frame_num)
+        if is_main_process():
+            logging.info(
+                "Running baseline Wan2.2 generation at %s with standard full attention",
+                metadata["size"])
+        set_self_attention_scale(model, 1.0)
+        set_block_tiled_self_attention(
+            model,
+            False,
+            args.block_tiled_self_attn_tile_height,
+            args.block_tiled_self_attn_tile_width,
+            args.block_tiled_self_attn_stride_height,
+            args.block_tiled_self_attn_stride_width,
+            args.block_tiled_self_attn_halo,
+            args.block_tiled_self_attn_routed_topk,
+            args.block_tiled_self_attn_routed_grid,
+            args.block_tiled_self_attn_global_attention_mode,
+            args.block_tiled_self_attn_global_rope_threshold,
+            args.adaptive_rectified_ntk_rope,
+            args.full_attention_rectified_rope,
+            False,
+            args.block_tiled_self_attn_blocks)
+        final_latent, _ = denoise_trajectory(
+            model=model,
+            start_latent=base_latent,
+            context=context,
+            context_null=context_null,
+            seq_len=seq_len,
+            scheduler=scheduler,
+            timesteps=timesteps,
+            sigmas=sigmas,
+            sample_steps=sample_steps,
+            start_index=0,
+            guide_scale=guide_scale,
+            offload_model=step_offload_model,
+            y=None)
+        if args.offload_model:
+            offload_dit_models(model)
+        if args.save_latent is not None and is_main_process():
+            payload = {
+                "final_latent": final_latent.detach().cpu(),
+                "initial_latent": None,
+                "prompt_base_latent": None,
+                "round_latents": [],
+                "metadata": {
+                    "video": None,
+                    "input_mode": "baseline_wan",
+                    "prompt": args.prompt,
+                    "negative_prompt": args.negative_prompt,
+                    "size": metadata["size"],
+                    "video_resize_mode": "prompt_direct",
+                    "latent_shape": tuple(final_latent.shape),
+                    "frame_num": frame_num,
+                    "fps": args.fps,
+                    "sample_steps": sample_steps,
+                    "sample_shift": sample_shift,
+                    "sample_guide_scale": guide_scale,
+                    "model_version": args.model_version,
+                    "ckpt_dir": args.ckpt_dir,
+                    "block_tiled_self_attn": False,
+                    "baseline_wan": True,
+                    "full_attention_rectified_rope": (
+                        args.full_attention_rectified_rope),
+                },
+            }
+            Path(args.save_latent).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(payload, args.save_latent)
+            logging.info("Saved baseline latent to %s", args.save_latent)
+        if args.save_video is not None and is_main_process():
+            model.vae.model.to(device=model.vae.device, dtype=model.vae.dtype)
+            save_latent_video_streaming(model.vae, final_latent,
+                                        args.save_video, args.fps,
+                                        args.decode_temporal_pad)
+            logging.info("Decoded baseline latent to %s", args.save_video)
+        del final_latent, base_latent, context, context_null
+        del timesteps, sigmas
+        gc.collect()
+        torch.cuda.empty_cache()
+        return
+
+    if args.target_noise_init:
+        base_latent, seq_len, metadata = create_prompt_noise_latent(
+            model, encode_size, frame_num)
+        if is_main_process():
+            logging.info(
+                "Running target-size pure-noise generation at %s with configured attention",
+                metadata["size"])
+            if args.noise_rounds != 1 or args.round_noise_steps != 1:
+                logging.info(
+                    "--target_noise_init=true: ignoring --noise_rounds/--round_noise_steps and denoising the full %d-step schedule from pure noise.",
+                    sample_steps)
+            if args.full_video_attention and args.block_tiled_self_attn:
+                logging.info(
+                    "--full_video_attention=true: disabling block-tiled/routed self-attention.")
+
+        set_self_attention_scale(model, args.self_attn_scale)
+        configure_block_tiled_attention(args.block_tiled_self_attn)
+        final_latent, _ = denoise_trajectory(
+            model=model,
+            start_latent=base_latent,
+            context=context,
+            context_null=context_null,
+            seq_len=seq_len,
+            scheduler=scheduler,
+            timesteps=timesteps,
+            sigmas=sigmas,
+            sample_steps=sample_steps,
+            start_index=0,
+            guide_scale=guide_scale,
+            offload_model=step_offload_model,
+            y=None)
+        if args.offload_model:
+            offload_dit_models(model)
+
+        if args.save_latent is not None and is_main_process():
+            payload = {
+                "final_latent": final_latent.detach().cpu(),
+                "initial_latent": base_latent.detach().cpu(),
+                "prompt_base_latent": None,
+                "round_latents": [],
+                "metadata": {
+                    "video": None,
+                    "input_mode": "target_noise_init",
+                    "prompt": args.prompt,
+                    "negative_prompt": args.negative_prompt,
+                    "size": metadata["size"],
+                    "video_resize_mode": "target_noise_init",
+                    "latent_shape": tuple(final_latent.shape),
+                    "initial_latent_shape": tuple(base_latent.shape),
+                    "frame_num": frame_num,
+                    "fps": args.fps,
+                    "sample_steps": sample_steps,
+                    "sample_shift": sample_shift,
+                    "sample_guide_scale": guide_scale,
+                    "round_noise_steps": None,
+                    "noise_rounds": None,
+                    "start_index": 0,
+                    "start_sigma": float(sigmas[0].detach().cpu()),
+                    "model_version": args.model_version,
+                    "ckpt_dir": args.ckpt_dir,
+                    "target_noise_init": True,
+                    "block_tiled_self_attn": args.block_tiled_self_attn,
+                    "full_video_attention": args.full_video_attention,
+                    "full_attention_rectified_rope": (
+                        args.full_attention_rectified_rope),
+                    "effective_block_tiled_self_attn": (
+                        args.block_tiled_self_attn and
+                        not args.full_video_attention),
+                    "adaptive_rectified_ntk_rope": (
+                        args.adaptive_rectified_ntk_rope),
+                    "block_tiled_self_attn_full_global": (
+                        args.block_tiled_self_attn_full_global),
+                    "block_tiled_self_attn_routed_topk": (
+                        args.block_tiled_self_attn_routed_topk),
+                    "block_tiled_self_attn_routed_grid": (
+                        args.block_tiled_self_attn_routed_grid),
+                    "block_tiled_self_attn_global_attention_mode": (
+                        args.block_tiled_self_attn_global_attention_mode),
+                    "block_tiled_self_attn_global_rope_threshold": (
+                        args.block_tiled_self_attn_global_rope_threshold),
+                },
+            }
+            Path(args.save_latent).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(payload, args.save_latent)
+            logging.info("Saved target-noise latent to %s", args.save_latent)
+
+        if args.save_video is not None and is_main_process():
+            Path(args.save_video).parent.mkdir(parents=True, exist_ok=True)
+            model.vae.model.to(device=model.vae.device, dtype=model.vae.dtype)
+            save_latent_video_streaming(model.vae, final_latent,
+                                        args.save_video, args.fps,
+                                        args.decode_temporal_pad)
+            logging.info("Decoded target-noise latent to %s", args.save_video)
+
+        del final_latent, base_latent, context, context_null
+        del timesteps, sigmas
+        gc.collect()
+        torch.cuda.empty_cache()
+        return
 
     prompt_base_latent_cpu = None
     if args.video is None:
@@ -1210,6 +1440,9 @@ def run(args, model, cfg):
             args.block_tiled_self_attn_routed_grid,
             args.block_tiled_self_attn_global_attention_mode,
             args.block_tiled_self_attn_global_rope_threshold,
+            args.adaptive_rectified_ntk_rope,
+            False,
+            False,
             args.block_tiled_self_attn_blocks)
         base_latent, _ = denoise_trajectory(
             model=model,
@@ -1217,6 +1450,7 @@ def run(args, model, cfg):
             context=context,
             context_null=context_null,
             seq_len=base_seq_len,
+            scheduler=scheduler,
             timesteps=timesteps,
             sigmas=sigmas,
             sample_steps=sample_steps,
@@ -1226,6 +1460,36 @@ def run(args, model, cfg):
             y=None)
         if args.save_latent is not None and is_main_process():
             prompt_base_latent_cpu = base_latent.detach().cpu()
+            prompt_base_payload = {
+                "final_latent": None,
+                "initial_latent": None,
+                "prompt_base_latent": prompt_base_latent_cpu,
+                "round_latents": [],
+                "metadata": {
+                    "video": None,
+                    "input_mode": "prompt_base",
+                    "prompt": args.prompt,
+                    "negative_prompt": args.negative_prompt,
+                    "size": prompt_base_size,
+                    "prompt_base_size": prompt_base_size,
+                    "prompt_base_latent_shape": tuple(base_latent.shape),
+                    "video_resize_mode": "prompt_base",
+                    "frame_num": frame_num,
+                    "fps": args.fps,
+                    "sample_steps": sample_steps,
+                    "sample_shift": sample_shift,
+                    "sample_guide_scale": guide_scale,
+                    "model_version": args.model_version,
+                    "ckpt_dir": args.ckpt_dir,
+                    "prompt_base_latent_saved": True,
+                    "incomplete": True,
+                    "status": "saved_after_prompt_base_generation",
+                },
+            }
+            Path(args.save_latent).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(prompt_base_payload, args.save_latent)
+            logging.info("Immediately saved 720p prompt base latent to %s",
+                         args.save_latent)
 
         if args.video_resize_mode == "latent":
             clean_latent, resize_metadata = resize_latent_to_size(
@@ -1242,10 +1506,7 @@ def run(args, model, cfg):
             if args.offload_model:
                 offload_dit_models(model)
                 model.vae.model.to(device=model.vae.device, dtype=model.vae.dtype)
-            base_video = save_latent_video_streaming_full_frame(
-                model.vae,
-                base_latent,
-                temporal_pad=args.decode_temporal_pad)
+            base_video = decode_latent_wan(model.vae, base_latent)
             target_width, target_height = parse_size(encode_size)
             target_lat_h, target_lat_w = best_latent_size(
                 target_width, target_height, target_width * target_height,
@@ -1306,22 +1567,10 @@ def run(args, model, cfg):
     set_self_attention_scale(model, args.self_attn_scale)
            
 
-    def configure_block_tiled_attention(enabled):
-        set_block_tiled_self_attention(
-            model,
-            enabled,
-            args.block_tiled_self_attn_tile_height,
-            args.block_tiled_self_attn_tile_width,
-            args.block_tiled_self_attn_stride_height,
-            args.block_tiled_self_attn_stride_width,
-            args.block_tiled_self_attn_halo,
-            args.block_tiled_self_attn_routed_topk,
-            args.block_tiled_self_attn_routed_grid,
-            args.block_tiled_self_attn_global_attention_mode,
-            args.block_tiled_self_attn_global_rope_threshold,
-            args.block_tiled_self_attn_blocks)
-
     configure_block_tiled_attention(args.block_tiled_self_attn)
+    if is_main_process() and args.full_video_attention and args.block_tiled_self_attn:
+        logging.info(
+            "--full_video_attention=true: disabling block-tiled/routed self-attention for the high-resolution denoise.")
 
     @contextmanager
     def noop_no_sync():
@@ -1352,6 +1601,13 @@ def run(args, model, cfg):
         "model_version": args.model_version,
         "ckpt_dir": args.ckpt_dir,
         "block_tiled_self_attn": args.block_tiled_self_attn,
+        "full_video_attention": args.full_video_attention,
+        "full_attention_rectified_rope": args.full_attention_rectified_rope,
+        "effective_block_tiled_self_attn": (
+            args.block_tiled_self_attn and not args.full_video_attention),
+        "adaptive_rectified_ntk_rope": args.adaptive_rectified_ntk_rope,
+        "block_tiled_self_attn_full_global": (
+            args.block_tiled_self_attn_full_global),
         "block_tiled_self_attn_routed_topk": (
             args.block_tiled_self_attn_routed_topk),
         "block_tiled_self_attn_routed_grid": (
@@ -1381,6 +1637,7 @@ def run(args, model, cfg):
                 context=context,
                 context_null=context_null,
                 seq_len=seq_len,
+                scheduler=scheduler,
                 timesteps=timesteps,
                 sigmas=sigmas,
                 sample_steps=sample_steps,
@@ -1457,6 +1714,10 @@ def parse_args():
         "--decode_latent",
         default=None,
         help="Decode this saved latent .pt and exit without loading DiT/T5.")
+    parser.add_argument(
+        "--decode_latent_key",
+        default="final_latent",
+        help="Which tensor to decode from a saved latent .pt: final_latent, prompt_base_latent, initial_latent, round_latents, or round_latents:N.")
 
     parser.add_argument(
         "--vae_dtype",
@@ -1478,6 +1739,16 @@ def parse_args():
         default="pixel",
         choices=("pixel", "latent"),
         help="pixel: resize frames to --size before VAE encoding. latent: encode at input/native size first, then bilinearly resize the VAE latent to --size.")
+    parser.add_argument(
+        "--baseline_wan",
+        type=str2bool,
+        default=False,
+        help="Generate directly at --size with standard Wan2.2 full attention/RoPE, bypassing the 720p base, upsample, noise restart, and tiled/routed attention path.")
+    parser.add_argument(
+        "--target_noise_init",
+        type=str2bool,
+        default=False,
+        help="Prompt-only mode: initialize pure noise directly at --size and denoise the full schedule using the configured attention/RoPE path. This bypasses the 720p base and noise-restart pipeline.")
 
     parser.add_argument("--frame_num", type=int, default=None)
     parser.add_argument("--sample_steps", type=int, default=None)
@@ -1518,6 +1789,26 @@ def parse_args():
         type=str2bool,
         default=False,
         help="Tile only DiT self-attention inside each block, stitch the self-attention output, then run global cross-attention/FFN.")
+    parser.add_argument(
+        "--block_tiled_self_attn_full_global",
+        type=str2bool,
+        default=False,
+        help="In block-tiled self-attention, compute each query tile against all full-frame K/V tokens, with K RoPE-encoded relative to the current tile. Disables top-k routing for attention selection.")
+    parser.add_argument(
+        "--full_video_attention",
+        type=str2bool,
+        default=False,
+        help="Force standard full-video self-attention during the high-resolution denoise. Overrides --block_tiled_self_attn and disables local/global routing.")
+    parser.add_argument(
+        "--full_attention_rectified_rope",
+        type=str2bool,
+        default=False,
+        help="Use full-video self-attention but apply adaptive rectified spatial RoPE to Q/K instead of standard full-canvas RoPE.")
+    parser.add_argument(
+        "--adaptive_rectified_ntk_rope",
+        type=str2bool,
+        default=True,
+        help="When block-tiled global/routed attention is enabled, use adaptive compressed-relative RoPE for retrieved global tokens. false uses ordinary full-canvas absolute RoPE for those tokens.")
     parser.add_argument(
         "--block_tiled_self_attn_tile_height",
         type=int,
@@ -1661,33 +1952,114 @@ if __name__ == "__main__":
 # python CineScale/Wan2.2/cinescale.py \
 #   --decode_latent CineScale/latent_result.pt \
 #   --ckpt_dir Wan2.2-T2V-A14B \
-#   --save_video CineScale/result_video.mp4
+#   --save_video CineScale/result_video.mp4  
 
-#   --video CineScale/Eiffel_Tower.mp4 \
+#   --decode_latent_key prompt_base_latent \
+
+#   --decode_latent_key prompt_base_latent \
+#   --decode_latent_key prompt_base_latent 
+
+# --decode_latent_key round_latents:1      # specific round
+# --decode_latent_key round_latents:2
+
+
+
+
+# --video CineScale/base_result.mp4 \
+
 
 # CUDA_VISIBLE_DEVICES=0,1,2,3 \
 # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 # torchrun --standalone --nproc_per_node=4 CineScale/Wan2.2/cinescale.py \
+# --video CineScale/base_latent.mp4 \
 #   --size "3840*2160" \
-#   --prompt "The camera zooms toward a tiny astronaut walking inside a snow globe, macro photography." \
+#   --prompt "Dusk time, soft lighting, side lighting, low contrast lighting, medium long shot, balanced composition, warm colors, two shot, daylight.A graceful Mongolian woman is performing the **bowl dance** on a vast grassland. She is wearing a bright red Mongolian robe embroidered with cloud and floral patterns, a wide silk sash at her waist, and a traditional hat with an exquisite headdress, her expression focused. As the camera moves to the left, she balances six porcelain bowls stacked on her head. Her steps are steady, and her arms sway like waves as she performs soft arm and shoulder shake movements. Simultaneously, she executes backbends, spins, and small jumps with movements that are both elegant and powerful. The background is a vast grassland with several yurts, and golden sunlight falls on the scene, creating a warm and magnificent atmosphere." \
 #   --ckpt_dir Wan2.2-T2V-A14B \
-#   --frame_num 21 \
+#   --frame_num 9 \
 #  --video_resize_mode pixel \
-#   --round_noise_steps 15 \
+#   --round_noise_steps 20 \
 #   --sample_shift 12 \
 #   --block_tiled_self_attn true \
-#   --block_tiled_self_attn_tile_height 24 \
-#   --block_tiled_self_attn_tile_width 24 \
+#   --block_tiled_self_attn_tile_height 20 \
+#   --block_tiled_self_attn_tile_width 20 \
 #   --block_tiled_self_attn_stride_height 20 \
 #   --block_tiled_self_attn_stride_width 20 \
 #   --block_tiled_self_attn_halo 6 \
-#  --block_tiled_self_attn_routed_topk 32 \
-#   --block_tiled_self_attn_routed_grid 3 \
+#  --block_tiled_self_attn_routed_topk 16 \
+#   --block_tiled_self_attn_routed_grid 5 \
 # --block_tiled_self_attn_global_attention_mode joint \
-# --block_tiled_self_attn_global_rope_threshold 40 \
+# --block_tiled_self_attn_global_rope_threshold 20 \
 #   --save_latent CineScale/latent_result.pt \
 # --decode_temporal_pad 0 \
-# --noise_rounds 2 \
+# --noise_rounds 1 \
+#   --ulysses_size 4 \
+#   --dit_fsdp \
+#   --t5_cpu \
+#   --offload_model true 
+
+
+
+
+
+# CUDA_VISIBLE_DEVICES=0,1,2,3 \
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+# torchrun --standalone --nproc_per_node=4 CineScale/Wan2.2/cinescale.py \
+# --video CineScale/base_latent.mp4 \
+#   --size "3840*2160" \
+#   --prompt "Dusk time, soft lighting, side lighting, low contrast lighting, medium long shot, balanced composition, warm colors, two shot, daylight.A graceful Mongolian woman is performing the **bowl dance** on a vast grassland. She is wearing a bright red Mongolian robe embroidered with cloud and floral patterns, a wide silk sash at her waist, and a traditional hat with an exquisite headdress, her expression focused. As the camera moves to the left, she balances six porcelain bowls stacked on her head. Her steps are steady, and her arms sway like waves as she performs soft arm and shoulder shake movements. Simultaneously, she executes backbends, spins, and small jumps with movements that are both elegant and powerful. The background is a vast grassland with several yurts, and golden sunlight falls on the scene, creating a warm and magnificent atmosphere." \
+#   --ckpt_dir Wan2.2-T2V-A14B \
+#   --frame_num 9 \
+#  --video_resize_mode pixel \
+#   --round_noise_steps 30  \
+#   --sample_shift 12 \
+#   --block_tiled_self_attn true \
+#   --block_tiled_self_attn_tile_height 20 \
+#   --block_tiled_self_attn_tile_width 20 \
+#   --block_tiled_self_attn_stride_height 20 \
+#   --block_tiled_self_attn_stride_width 20 \
+#   --block_tiled_self_attn_halo 6 \
+#  --block_tiled_self_attn_routed_topk 16 \
+#   --block_tiled_self_attn_routed_grid 5 \
+# --block_tiled_self_attn_global_attention_mode joint \
+# --block_tiled_self_attn_global_rope_threshold 20 \
+#   --save_latent CineScale/latent_result.pt \
+# --block_tiled_self_attn true \
+# --block_tiled_self_attn_full_global true \
+# --adaptive_rectified_ntk_rope true \
+# --full_video_attention false \
+# --decode_temporal_pad 0 \
+# --noise_rounds 1 \
+#   --ulysses_size 4 \
+#   --dit_fsdp \
+#   --t5_cpu \
+#   --offload_model true 
+
+
+
+# CUDA_VISIBLE_DEVICES=0,1,2,3 \
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+# torchrun --standalone --nproc_per_node=4 CineScale/Wan2.2/cinescale.py \
+# --target_noise_init true \
+#   --size "3840*2160" \
+#   --prompt "This is a running scene. A sprinter, his face distorted from extreme exertion with taut facial muscles and a clenched jaw, is wearing a lightweight, form-fitting track singlet and shorts, along with professional spikes. At the finish line of a 100-meter dash, he is sprinting at full power with astonishing speed. His body is leaning forward, head straining ahead, and his arms are swinging with maximum amplitude and frequency." \
+#   --ckpt_dir Wan2.2-T2V-A14B \
+#   --frame_num 17 \
+#   --video_resize_mode pixel \
+#   --round_noise_steps 20 \
+#   --noise_rounds 1 \
+#   --sample_shift 12 \
+# --block_tiled_self_attn_tile_height 20 \
+# --block_tiled_self_attn_tile_width 20 \
+# --block_tiled_self_attn_stride_height 20 \
+# --block_tiled_self_attn_stride_width 20 \
+# --block_tiled_self_attn_halo 6 \
+# --block_tiled_self_attn_global_rope_threshold 40 \
+# --block_tiled_self_attn true \
+# --block_tiled_self_attn_full_global true \
+# --adaptive_rectified_ntk_rope true \
+# --full_video_attention false \
+#   --save_latent CineScale/latent_result.pt \
+#   --decode_temporal_pad 0 \
 #   --ulysses_size 4 \
 #   --dit_fsdp \
 #   --t5_cpu \

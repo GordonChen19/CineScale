@@ -66,6 +66,91 @@ def rope_apply(x, grid_sizes, freqs):
     return torch.stack(output).float()
 
 
+def _rectified_positions(length, train_length, threshold, device):
+    center = (length - 1) / 2.0
+    target_center = (train_length - 1) / 2.0
+    max_pos = float(length - 1)
+    train_max_pos = float(train_length - 1)
+    total = 2.0 * threshold
+
+    neg_room = max(center, 0.0)
+    pos_room = max(max_pos - center, 0.0)
+    target_neg_room = max(target_center, 0.0)
+    target_pos_room = max(train_max_pos - target_center, 0.0)
+
+    t_neg = min(threshold, neg_room)
+    t_pos = min(threshold, pos_room)
+    unused = total - (t_neg + t_pos)
+
+    pos_extra = min(unused, max(pos_room - t_pos, 0.0))
+    t_pos += pos_extra
+    unused -= pos_extra
+
+    neg_extra = min(unused, max(neg_room - t_neg, 0.0))
+    t_neg += neg_extra
+
+    t_neg = min(t_neg, target_neg_room)
+    t_pos = min(t_pos, target_pos_room)
+
+    def side_compression(full_room, target_room, side_threshold):
+        full_tail = max(float(full_room) - float(side_threshold), 0.0)
+        target_tail = max(float(target_room) - float(side_threshold), 0.0)
+        if full_tail <= target_tail or full_tail <= 0:
+            return 1.0
+        if target_tail <= 1e-6:
+            return 1e6
+        return full_tail / target_tail
+
+    s_neg = side_compression(neg_room, target_neg_room, t_neg)
+    s_pos = side_compression(pos_room, target_pos_room, t_pos)
+
+    pos = torch.arange(length, device=device, dtype=torch.float32)
+    delta = pos - center
+    t_neg = torch.tensor(t_neg, device=device, dtype=torch.float32)
+    t_pos = torch.tensor(t_pos, device=device, dtype=torch.float32)
+    s_neg = torch.tensor(s_neg, device=device, dtype=torch.float32)
+    s_pos = torch.tensor(s_pos, device=device, dtype=torch.float32)
+    warped = torch.where(
+        delta < -t_neg,
+        -(t_neg + (delta.abs() - t_neg) / s_neg),
+        torch.where(delta > t_pos,
+                    t_pos + (delta - t_pos) / s_pos, delta))
+    return torch.round(target_center + warped).long().clamp(
+        0, int(train_max_pos))
+
+
+@torch.amp.autocast('cuda', enabled=False)
+def rope_apply_full_rectified(x,
+                              grid_sizes,
+                              freqs,
+                              threshold,
+                              train_720_h=45,
+                              train_720_w=80):
+    n, c = x.size(2), x.size(3) // 2
+    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+    output = []
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
+            seq_len, n, -1, 2))
+        y_idx = _rectified_positions(
+            h, train_720_h, threshold, x.device).clamp(0, freqs[1].shape[0] - 1)
+        x_idx = _rectified_positions(
+            w, train_720_w, threshold, x.device).clamp(0, freqs[2].shape[0] - 1)
+        freqs_i = torch.cat([
+            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs[1][y_idx].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs[2][x_idx].view(1, 1, w, -1).expand(f, h, w, -1)
+        ],
+                            dim=-1).reshape(seq_len, 1, -1)
+
+        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        x_i = torch.cat([x_i, x[i, seq_len:]])
+        output.append(x_i)
+    return torch.stack(output).float()
+
+
 class WanRMSNorm(nn.Module):
 
     def __init__(self, dim, eps=1e-5):
@@ -131,6 +216,9 @@ class WanSelfAttention(nn.Module):
         self.block_tiled_attn_routed_grid = 3
         self.block_tiled_attn_global_attention_mode = "separate"
         self.block_tiled_attn_global_rope_threshold = 24.0
+        self.block_tiled_attn_adaptive_rectified_rope = True
+        self.block_tiled_attn_full_global = False
+        self.full_attn_rectified_rope = False
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -163,8 +251,16 @@ class WanSelfAttention(nn.Module):
             x = self.block_tiled_self_attention(q, k, v, seq_lens,
                                                 grid_sizes, freqs)
         else:
-            q = rope_apply(q, grid_sizes, freqs)
-            k = rope_apply(k, grid_sizes, freqs)
+            if self.full_attn_rectified_rope:
+                q = rope_apply_full_rectified(
+                    q, grid_sizes, freqs,
+                    self.block_tiled_attn_global_rope_threshold)
+                k = rope_apply_full_rectified(
+                    k, grid_sizes, freqs,
+                    self.block_tiled_attn_global_rope_threshold)
+            else:
+                q = rope_apply(q, grid_sizes, freqs)
+                k = rope_apply(k, grid_sizes, freqs)
 
             if (self.anchor_attn_stride > 1 and self.anchor_attn_scale != 0
                 and self.anchor_attn_local_window > 0):
@@ -197,6 +293,8 @@ class WanSelfAttention(nn.Module):
         routed_grid = self.block_tiled_attn_routed_grid
         global_attention_mode = self.block_tiled_attn_global_attention_mode
         rope_threshold = self.block_tiled_attn_global_rope_threshold
+        adaptive_rectified_rope = self.block_tiled_attn_adaptive_rectified_rope
+        full_global_attention = self.block_tiled_attn_full_global
         train_720_h = 45
         train_720_w = 80
         if min(tile_h, tile_w, stride_h, stride_w) <= 0:
@@ -324,6 +422,13 @@ class WanSelfAttention(nn.Module):
         def global_rope_indices(frame_idx, y_idx, x_idx, full_center_y,
                                 full_center_x, local_center_y,
                                 local_center_x):
+            if not adaptive_rectified_rope:
+                return (
+                    frame_idx.clamp(0, freqs.shape[0] - 1),
+                    y_idx.clamp(0, freqs.shape[0] - 1),
+                    x_idx.clamp(0, freqs.shape[0] - 1),
+                    freqs,
+                )
             return (
                 frame_idx,
                 warp_relative_positions(y_idx, full_center_y, local_center_y,
@@ -351,6 +456,25 @@ class WanSelfAttention(nn.Module):
             global_frame = None
             route_k = None
             route_bounds = None
+            all_k_flat = None
+            all_v_flat = None
+            all_frame_idx = None
+            all_y_idx = None
+            all_x_idx = None
+            if full_global_attention:
+                all_k_flat = k_grid.reshape(seq_len, self.num_heads,
+                                            self.head_dim)
+                all_v_flat = v_grid.reshape(1, seq_len, self.num_heads,
+                                            self.head_dim)
+                all_frame_idx = torch.arange(
+                    f, device=v.device, dtype=torch.long).view(
+                        f, 1, 1).expand(f, h, w).reshape(-1)
+                all_y_idx = torch.arange(
+                    h, device=v.device, dtype=torch.long).view(
+                        1, h, 1).expand(f, h, w).reshape(-1)
+                all_x_idx = torch.arange(
+                    w, device=v.device, dtype=torch.long).view(
+                        1, 1, w).expand(f, h, w).reshape(-1)
             if global_stride > 0 and global_scale > 0:
                 k_sparse = k_grid[:, ::global_stride, ::global_stride]
                 v_sparse = v_grid[:, ::global_stride, ::global_stride]
@@ -424,128 +548,185 @@ class WanSelfAttention(nn.Module):
                     global_q_flat = q_flat
                     joint_q_flat = q_flat
                     joint_k_flat = k_flat
-                    if route_k is not None:
+                    if full_global_attention:
+                        g_frame, g_y, g_x, g_freqs = global_rope_indices(
+                            all_frame_idx, all_y_idx, all_x_idx,
+                            full_center_y, full_center_x,
+                            local_center_y, local_center_x)
+                        global_k_flat = rope_apply_absolute(
+                            all_k_flat, g_frame, g_y, g_x,
+                            g_freqs).reshape(
+                                1, seq_len, self.num_heads, self.head_dim)
+                        y_crop = flash_attention(
+                            q=q_flat,
+                            k=global_k_flat,
+                            v=all_v_flat,
+                            softmax_scale=scale).view(
+                                f, cy1 - cy0, cx1 - cx0, self.num_heads,
+                                self.head_dim)
+                    elif route_k is not None:
                         selected_k = []
                         selected_v = []
-                        for frame in range(f):
-                            route_queries = []
-                            route_query_frames = []
-                            route_query_ys = []
-                            route_query_xs = []
-                            for qy0 in range(y0, y1, routed_grid):
-                                qy1 = min(qy0 + routed_grid, y1)
-                                for qx0 in range(x0, x1, routed_grid):
-                                    qx1 = min(qx0 + routed_grid, x1)
-                                    route_queries.append(
-                                        q_grid[frame, qy0:qy1,
-                                               qx0:qx1].mean(dim=(0, 1)))
-                                    route_query_frames.append(frame)
-                                    route_query_ys.append((qy0 + qy1 - 1) // 2)
-                                    route_query_xs.append((qx0 + qx1 - 1) // 2)
-
-                            route_q = torch.stack(route_queries, dim=0)
-                            route_frame_idx = torch.tensor(
-                                route_query_frames,
+                        selected_route_indices = []
+                        selected_route_seen = set()
+                        cells_per_frame = route_k.shape[0] // f
+                        route_k_by_frame = route_k.view(
+                            f, cells_per_frame, self.num_heads,
+                            self.head_dim)
+                        route_bounds_by_frame = route_bounds.view(
+                            f, cells_per_frame, 5)
+                        query_cells = []
+                        query_y_centers = []
+                        query_x_centers = []
+                        for qy0 in range(y0, y1, routed_grid):
+                            qy1 = min(qy0 + routed_grid, y1)
+                            for qx0 in range(x0, x1, routed_grid):
+                                qx1 = min(qx0 + routed_grid, x1)
+                                query_cells.append((qy0, qy1, qx0, qx1))
+                                query_y_centers.append((qy0 + qy1 - 1) // 2)
+                                query_x_centers.append((qx0 + qx1 - 1) // 2)
+                        query_y_centers = torch.tensor(
+                            query_y_centers,
+                            device=v.device,
+                            dtype=torch.long)
+                        query_x_centers = torch.tensor(
+                            query_x_centers,
+                            device=v.device,
+                            dtype=torch.long)
+                        frame_bounds = route_bounds_by_frame
+                        frame_route_k = route_k_by_frame
+                        route_frame = frame_bounds[:, :, 0].reshape(-1)
+                        route_y = (frame_bounds[:, :, 1] +
+                                   frame_bounds[:, :, 2] - 1).reshape(
+                                       -1) // 2
+                        route_x = (frame_bounds[:, :, 3] +
+                                   frame_bounds[:, :, 4] - 1).reshape(
+                                       -1) // 2
+                        route_frame, route_y, route_x, route_freqs = (
+                            global_rope_indices(route_frame, route_y, route_x,
+                                                full_center_y, full_center_x,
+                                                local_center_y,
+                                                local_center_x))
+                        k_route = rope_apply_absolute(
+                            frame_route_k.reshape(f * cells_per_frame,
+                                                  self.num_heads,
+                                                  self.head_dim),
+                            route_frame, route_y, route_x,
+                            route_freqs).mean(dim=1).float()
+                        k_route = k_route.view(f, cells_per_frame, -1)
+                        k_route_flat_all = k_route.reshape(
+                            1, f * cells_per_frame, -1)
+                        outside = (
+                            (frame_bounds[:, :, 2] <= cy0) |
+                            (frame_bounds[:, :, 1] >= cy1) |
+                            (frame_bounds[:, :, 4] <= cx0) |
+                            (frame_bounds[:, :, 3] >= cx1))
+                        valid_counts = outside.sum(dim=1)
+                        # Batch routing score matmuls over a small frame chunk.
+                        # Full-frame batching can allocate very large RoPE
+                        # temporaries at 4K, so keep this conservative.
+                        route_frame_batch = 2
+                        for frame_start in range(0, f, route_frame_batch):
+                            frame_end = min(f, frame_start + route_frame_batch)
+                            frames_in_chunk = frame_end - frame_start
+                            route_queries = [
+                                q_grid[frame_start:frame_end, qy0:qy1,
+                                       qx0:qx1].mean(dim=(1, 2))
+                                for qy0, qy1, qx0, qx1 in query_cells
+                            ]
+                            route_q = torch.stack(route_queries, dim=1)
+                            query_count = route_q.shape[1]
+                            route_q = route_q.reshape(
+                                frames_in_chunk * query_count,
+                                self.num_heads, self.head_dim)
+                            route_frame_idx = torch.arange(
+                                frame_start,
+                                frame_end,
                                 device=v.device,
-                                dtype=torch.long)
-                            route_y_idx = torch.tensor(
-                                route_query_ys,
-                                device=v.device,
-                                dtype=torch.long)
-                            route_x_idx = torch.tensor(
-                                route_query_xs,
-                                device=v.device,
-                                dtype=torch.long)
+                                dtype=torch.long).view(
+                                    frames_in_chunk, 1).expand(
+                                        frames_in_chunk,
+                                        query_count).reshape(-1)
+                            route_y_idx = query_y_centers.view(
+                                1, query_count).expand(
+                                    frames_in_chunk, query_count).reshape(-1)
+                            route_x_idx = query_x_centers.view(
+                                1, query_count).expand(
+                                    frames_in_chunk, query_count).reshape(-1)
                             route_frame_idx, route_y_idx, route_x_idx, route_freqs = (
                                 global_rope_indices(
                                     route_frame_idx, route_y_idx, route_x_idx,
                                     full_center_y, full_center_x,
                                     local_center_y, local_center_x))
                             q_route = rope_apply_absolute(
-                                route_q.reshape(route_q.shape[0],
-                                                self.num_heads,
-                                                self.head_dim),
-                                route_frame_idx, route_y_idx, route_x_idx,
-                                route_freqs).mean(dim=1).float()
+                                route_q, route_frame_idx, route_y_idx,
+                                route_x_idx, route_freqs).mean(dim=1).float()
+                            q_route = q_route.view(frames_in_chunk,
+                                                   query_count, -1)
 
-                            same_frame = route_bounds[:, 0] == frame
-                            if not bool(same_frame.any().item()):
-                                continue
-                            frame_indices = same_frame.nonzero(
-                                as_tuple=False).flatten()
-                            frame_bounds = route_bounds[frame_indices]
-                            frame_route_k = route_k[frame_indices]
-                            route_frame = frame_bounds[:, 0]
-                            route_y = (frame_bounds[:, 1] +
-                                       frame_bounds[:, 2] - 1) // 2
-                            route_x = (frame_bounds[:, 3] +
-                                       frame_bounds[:, 4] - 1) // 2
-                            route_frame, route_y, route_x, route_freqs = (
+                            k_route_flat = k_route_flat_all.expand(
+                                frames_in_chunk, -1, -1)
+                            scores = torch.bmm(
+                                k_route_flat,
+                                q_route.transpose(1, 2)).max(dim=2).values
+                            scores = scores.view(frames_in_chunk, f,
+                                                 cells_per_frame)
+                            scores = scores.masked_fill(
+                                ~outside.unsqueeze(0), -torch.inf)
+                            for chunk_frame in range(frames_in_chunk):
+                                for candidate_frame in range(f):
+                                    valid_count = int(valid_counts[
+                                        candidate_frame].item())
+                                    if valid_count <= 0:
+                                        continue
+                                    topk = min(routed_topk, valid_count)
+                                    selected_local = torch.topk(
+                                        scores[chunk_frame, candidate_frame],
+                                        k=topk).indices
+                                    selected = (
+                                        candidate_frame * cells_per_frame +
+                                        selected_local)
+                                    for route_index in selected.tolist():
+                                        if route_index in selected_route_seen:
+                                            continue
+                                        selected_route_seen.add(route_index)
+                                        selected_route_indices.append(route_index)
+                        for route_index in selected_route_indices:
+                            frame, gy0, gy1, gx0, gx1 = (
+                                route_bounds[route_index].tolist())
+                            k_cell = k_grid[frame:frame + 1, gy0:gy1, gx0:gx1]
+                            k_cell = k_cell.reshape(
+                                (gy1 - gy0) * (gx1 - gx0),
+                                self.num_heads, self.head_dim)
+                            cell_frame_idx = torch.full(
+                                (k_cell.size(0),),
+                                frame,
+                                device=v.device,
+                                dtype=torch.long)
+                            cell_y_idx = torch.arange(
+                                gy0, gy1, device=v.device,
+                                dtype=torch.long).view(
+                                    gy1 - gy0, 1).expand(
+                                        gy1 - gy0, gx1 - gx0).reshape(-1)
+                            cell_x_idx = torch.arange(
+                                gx0, gx1, device=v.device,
+                                dtype=torch.long).view(
+                                    1, gx1 - gx0).expand(
+                                        gy1 - gy0, gx1 - gx0).reshape(-1)
+                            cell_frame_idx, cell_y_idx, cell_x_idx, cell_freqs = (
                                 global_rope_indices(
-                                    route_frame, route_y, route_x,
+                                    cell_frame_idx, cell_y_idx, cell_x_idx,
                                     full_center_y, full_center_x,
                                     local_center_y, local_center_x))
-                            k_route = rope_apply_absolute(
-                                frame_route_k.reshape(
-                                    frame_route_k.shape[0], self.num_heads,
-                                    self.head_dim), route_frame, route_y,
-                                route_x, route_freqs).mean(dim=1).float()
-                            q_route = torch.nn.functional.normalize(
-                                q_route, dim=1)
-                            k_route = torch.nn.functional.normalize(
-                                k_route, dim=1)
-                            scores = torch.matmul(k_route,
-                                                  q_route.T).max(dim=1).values
-                            outside = (
-                                (frame_bounds[:, 2] <= cy0) |
-                                (frame_bounds[:, 1] >= cy1) |
-                                (frame_bounds[:, 4] <= cx0) |
-                                (frame_bounds[:, 3] >= cx1))
-                            scores = scores.masked_fill(~outside, -torch.inf)
-                            valid_count = int(outside.sum().item())
-                            if valid_count <= 0:
-                                continue
-                            topk = min(routed_topk, valid_count)
-                            selected = frame_indices[
-                                torch.topk(scores, k=topk).indices]
-                            for route_index in selected.tolist():
-                                frame, gy0, gy1, gx0, gx1 = (
-                                    route_bounds[route_index].tolist())
-                                k_cell = k_grid[frame:frame + 1, gy0:gy1,
-                                                gx0:gx1]
-                                k_cell = k_cell.reshape(
-                                    (gy1 - gy0) * (gx1 - gx0),
-                                    self.num_heads, self.head_dim)
-                                cell_frame_idx = torch.full(
-                                    (k_cell.size(0),),
-                                    frame,
-                                    device=v.device,
-                                    dtype=torch.long)
-                                cell_y_idx = torch.arange(
-                                    gy0, gy1, device=v.device,
-                                    dtype=torch.long).view(
-                                        gy1 - gy0, 1).expand(
-                                            gy1 - gy0, gx1 - gx0).reshape(-1)
-                                cell_x_idx = torch.arange(
-                                    gx0, gx1, device=v.device,
-                                    dtype=torch.long).view(
-                                        1, gx1 - gx0).expand(
-                                            gy1 - gy0, gx1 - gx0).reshape(-1)
-                                cell_frame_idx, cell_y_idx, cell_x_idx, cell_freqs = (
-                                    global_rope_indices(
-                                        cell_frame_idx, cell_y_idx,
-                                        cell_x_idx, full_center_y,
-                                        full_center_x, local_center_y,
-                                        local_center_x))
-                                selected_k.append(
-                                    rope_apply_absolute(
-                                        k_cell, cell_frame_idx, cell_y_idx,
-                                        cell_x_idx, cell_freqs))
-                                selected_v.append(
-                                    v_grid[frame:frame + 1, gy0:gy1,
-                                           gx0:gx1].reshape(
-                                               -1, self.num_heads,
-                                               self.head_dim))
+                            selected_k.append(
+                                rope_apply_absolute(
+                                    k_cell, cell_frame_idx, cell_y_idx,
+                                    cell_x_idx, cell_freqs))
+                            selected_v.append(
+                                v_grid[frame:frame + 1, gy0:gy1,
+                                       gx0:gx1].reshape(
+                                           -1, self.num_heads,
+                                           self.head_dim))
                         if selected_k:
                             selected_k = torch.cat(selected_k, dim=0)
                             selected_v = torch.cat(selected_v, dim=0)
@@ -574,7 +755,8 @@ class WanSelfAttention(nn.Module):
                             g_freqs).reshape(
                                 1, global_k_flat.shape[1], self.num_heads,
                                 self.head_dim)
-                    if (global_attention_mode == "joint"
+                    if (not full_global_attention
+                            and global_attention_mode == "joint"
                             and global_k_flat is not None
                             and global_v_flat is not None):
                         k_all = torch.cat([joint_k_flat, global_k_flat],
@@ -588,7 +770,7 @@ class WanSelfAttention(nn.Module):
                             softmax_scale=scale).view(
                                 f, cy1 - cy0, cx1 - cx0, self.num_heads,
                                 self.head_dim)
-                    else:
+                    elif not full_global_attention:
                         y_crop = flash_attention(
                             q=q_flat,
                             k=k_flat,
@@ -596,7 +778,8 @@ class WanSelfAttention(nn.Module):
                             softmax_scale=scale).view(
                                 f, cy1 - cy0, cx1 - cx0, self.num_heads,
                                 self.head_dim)
-                    if (global_attention_mode == "separate"
+                    if (not full_global_attention
+                            and global_attention_mode == "separate"
                             and global_k_flat is not None
                             and global_v_flat is not None):
                         y_global = flash_attention(

@@ -199,11 +199,6 @@ class WanSelfAttention(nn.Module):
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
-        self.attn_scale = 1.0
-        self.anchor_attn_stride = 1
-        self.anchor_attn_scale = 0.0
-        self.anchor_attn_local_window = 0
-        self.anchor_attn_local_halo = 0
         self.block_tiled_attn_enabled = False
         self.block_tiled_attn_tile_h = 0
         self.block_tiled_attn_tile_w = 0
@@ -211,10 +206,8 @@ class WanSelfAttention(nn.Module):
         self.block_tiled_attn_stride_w = 0
         self.block_tiled_attn_halo = 0
         self.block_tiled_attn_global_stride = 0
-        self.block_tiled_attn_global_scale = 1.0
         self.block_tiled_attn_routed_topk = 0
         self.block_tiled_attn_routed_grid = 3
-        self.block_tiled_attn_global_attention_mode = "separate"
         self.block_tiled_attn_global_rope_threshold = 24.0
         self.block_tiled_attn_adaptive_rectified_rope = True
         self.block_tiled_attn_full_global = False
@@ -262,17 +255,13 @@ class WanSelfAttention(nn.Module):
                 q = rope_apply(q, grid_sizes, freqs)
                 k = rope_apply(k, grid_sizes, freqs)
 
-            if (self.anchor_attn_stride > 1 and self.anchor_attn_scale != 0
-                and self.anchor_attn_local_window > 0):
-                x = self.anchor_attention(q, k, v, seq_lens, grid_sizes)
-            else:
-                x = flash_attention(
-                    q=q,
-                    k=k,
-                    v=v,
-                    k_lens=seq_lens,
-                    window_size=self.window_size,
-                    softmax_scale=self.attn_scale / math.sqrt(d))
+            x = flash_attention(
+                q=q,
+                k=k,
+                v=v,
+                k_lens=seq_lens,
+                window_size=self.window_size,
+                softmax_scale=1.0 / math.sqrt(d))
 
         # output
         x = x.flatten(2)
@@ -281,17 +270,15 @@ class WanSelfAttention(nn.Module):
 
     def block_tiled_self_attention(self, q, k, v, seq_lens, grid_sizes, freqs):
         out = torch.zeros_like(v)
-        scale = self.attn_scale / math.sqrt(self.head_dim)
+        scale = 1.0 / math.sqrt(self.head_dim)
         tile_h = self.block_tiled_attn_tile_h
         tile_w = self.block_tiled_attn_tile_w
         stride_h = self.block_tiled_attn_stride_h
         stride_w = self.block_tiled_attn_stride_w
         halo = self.block_tiled_attn_halo
         global_stride = self.block_tiled_attn_global_stride
-        global_scale = self.block_tiled_attn_global_scale
         routed_topk = self.block_tiled_attn_routed_topk
         routed_grid = self.block_tiled_attn_routed_grid
-        global_attention_mode = self.block_tiled_attn_global_attention_mode
         rope_threshold = self.block_tiled_attn_global_rope_threshold
         adaptive_rectified_rope = self.block_tiled_attn_adaptive_rectified_rope
         full_global_attention = self.block_tiled_attn_full_global
@@ -301,16 +288,10 @@ class WanSelfAttention(nn.Module):
             raise ValueError("Block tiled self-attention tile/stride values must be positive.")
         if global_stride < 0:
             raise ValueError("Block tiled self-attention global stride must be non-negative.")
-        if global_scale < 0:
-            raise ValueError("Block tiled self-attention global scale must be non-negative.")
         if routed_topk < 0:
             raise ValueError("Block tiled self-attention routed top-k must be non-negative.")
         if routed_grid <= 0:
             raise ValueError("Block tiled self-attention routed grid size must be positive.")
-        if global_attention_mode not in ("separate", "joint"):
-            raise ValueError(
-                "Block tiled self-attention global attention mode must be "
-                "'separate' or 'joint'.")
         if rope_threshold < 0:
             raise ValueError(
                 "Block tiled self-attention global RoPE threshold must be non-negative."
@@ -475,7 +456,7 @@ class WanSelfAttention(nn.Module):
                 all_x_idx = torch.arange(
                     w, device=v.device, dtype=torch.long).view(
                         1, 1, w).expand(f, h, w).reshape(-1)
-            if global_stride > 0 and global_scale > 0:
+            if global_stride > 0:
                 k_sparse = k_grid[:, ::global_stride, ::global_stride]
                 v_sparse = v_grid[:, ::global_stride, ::global_stride]
                 sparse_len = f * k_sparse.shape[1] * k_sparse.shape[2]
@@ -493,7 +474,7 @@ class WanSelfAttention(nn.Module):
                 global_frame = torch.arange(
                     f, device=v.device, dtype=torch.long).view(f, 1).expand(
                         f, yy.numel()).reshape(-1)
-            if routed_topk > 0 and global_scale > 0:
+            if routed_topk > 0:
                 route_keys = []
                 route_bounds_list = []
                 for frame in range(f):
@@ -545,9 +526,6 @@ class WanSelfAttention(nn.Module):
                     k_flat = rope_apply(k_flat, crop_grid, freqs)
                     global_k_flat = None
                     global_v_flat = None
-                    global_q_flat = q_flat
-                    joint_q_flat = q_flat
-                    joint_k_flat = k_flat
                     if full_global_attention:
                         g_frame, g_y, g_x, g_freqs = global_rope_indices(
                             all_frame_idx, all_y_idx, all_x_idx,
@@ -755,16 +733,13 @@ class WanSelfAttention(nn.Module):
                             g_freqs).reshape(
                                 1, global_k_flat.shape[1], self.num_heads,
                                 self.head_dim)
-                    if (not full_global_attention
-                            and global_attention_mode == "joint"
-                            and global_k_flat is not None
-                            and global_v_flat is not None):
-                        k_all = torch.cat([joint_k_flat, global_k_flat],
-                                          dim=1)
-                        v_all = torch.cat(
-                            [v_flat, global_scale * global_v_flat], dim=1)
+                    if (not full_global_attention and
+                            global_k_flat is not None and
+                            global_v_flat is not None):
+                        k_all = torch.cat([k_flat, global_k_flat], dim=1)
+                        v_all = torch.cat([v_flat, global_v_flat], dim=1)
                         y_crop = flash_attention(
-                            q=joint_q_flat,
+                            q=q_flat,
                             k=k_all,
                             v=v_all,
                             softmax_scale=scale).view(
@@ -778,18 +753,6 @@ class WanSelfAttention(nn.Module):
                             softmax_scale=scale).view(
                                 f, cy1 - cy0, cx1 - cx0, self.num_heads,
                                 self.head_dim)
-                    if (not full_global_attention
-                            and global_attention_mode == "separate"
-                            and global_k_flat is not None
-                            and global_v_flat is not None):
-                        y_global = flash_attention(
-                            q=global_q_flat,
-                            k=global_k_flat,
-                            v=global_v_flat,
-                            softmax_scale=scale).view(
-                                f, cy1 - cy0, cx1 - cx0, self.num_heads,
-                                self.head_dim)
-                        y_crop = y_crop + global_scale * y_global
                     y_inner = y_crop[:, iy0:iy1, ix0:ix1]
                     blend = blend_window(y1 - y0, x1 - x0, v.device,
                                          torch.float32)
@@ -802,101 +765,6 @@ class WanSelfAttention(nn.Module):
                     seq_len, self.num_heads, self.head_dim)
 
         return out
-
-    def anchor_attention(self, q, k, v, seq_lens, grid_sizes):
-        out = torch.zeros_like(v)
-        scale = self.attn_scale / math.sqrt(self.head_dim)
-
-        for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-            seq_len = int(seq_lens[i].item())
-            window = self.anchor_attn_local_window
-            halo = self.anchor_attn_local_halo
-            stride = self.anchor_attn_stride
-
-            q_i = q[i, :seq_len].view(f, h, w, self.num_heads, self.head_dim)
-            k_i = k[i, :seq_len].view(f, h, w, self.num_heads, self.head_dim)
-            v_i = v[i, :seq_len].view(f, h, w, self.num_heads, self.head_dim)
-
-            y_local = self.local_window_attention(q_i, k_i, v_i, window,
-                                                  halo, scale)
-
-            q_flat = q_i.reshape(1, seq_len, self.num_heads, self.head_dim)
-            k_anchor = self.pool_anchor_tokens(k_i, stride)
-            v_anchor = self.pool_anchor_tokens(v_i, stride)
-            y_anchor = flash_attention(
-                q=q_flat,
-                k=k_anchor,
-                v=v_anchor,
-                softmax_scale=scale).view(f, h, w, self.num_heads,
-                                          self.head_dim)
-
-            y_i = y_local + self.anchor_attn_scale * y_anchor
-            out[i, :seq_len] = y_i.reshape(seq_len, self.num_heads,
-                                           self.head_dim)
-
-        return out
-
-    def pool_anchor_tokens(self, x, stride):
-        f, h, w, n, d = x.shape
-        pad_h = (stride - h % stride) % stride
-        pad_w = (stride - w % stride) % stride
-        if pad_h or pad_w:
-            x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, pad_w, 0, pad_h))
-        hp, wp = h + pad_h, w + pad_w
-        x = x.view(f, hp // stride, stride, wp // stride, stride, n, d)
-        return x.mean(dim=(2, 4)).reshape(1, -1, n, d)
-
-    def local_window_attention(self, q, k, v, window, halo, softmax_scale):
-        f, h, w, n, d = q.shape
-        pad_h = (window - h % window) % window
-        pad_w = (window - w % window) % window
-
-        def pad_query(x):
-            if pad_h or pad_w:
-                x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, pad_w, 0,
-                                                pad_h))
-            hp, wp = h + pad_h, w + pad_w
-            x = x.view(f, hp // window, window, wp // window, window, n, d)
-            x = x.permute(0, 1, 3, 2, 4, 5, 6).reshape(
-                -1, window * window, n, d)
-            return x, hp, wp
-
-        q_win, hp, wp = pad_query(q)
-
-        if halo <= 0:
-            k_win, _, _ = pad_query(k)
-            v_win, _, _ = pad_query(v)
-        else:
-            kv_window = window + 2 * halo
-            k_pad = torch.nn.functional.pad(
-                k, (0, 0, 0, 0, halo, pad_w + halo, halo, pad_h + halo))
-            v_pad = torch.nn.functional.pad(
-                v, (0, 0, 0, 0, halo, pad_w + halo, halo, pad_h + halo))
-            k_blocks = []
-            v_blocks = []
-            for frame in range(f):
-                for y0 in range(0, hp, window):
-                    for x0 in range(0, wp, window):
-                        k_blocks.append(
-                            k_pad[frame, y0:y0 + kv_window,
-                                  x0:x0 + kv_window].reshape(
-                                      kv_window * kv_window, n, d))
-                        v_blocks.append(
-                            v_pad[frame, y0:y0 + kv_window,
-                                  x0:x0 + kv_window].reshape(
-                                      kv_window * kv_window, n, d))
-            k_win = torch.stack(k_blocks, dim=0)
-            v_win = torch.stack(v_blocks, dim=0)
-
-        y = flash_attention(
-            q=q_win,
-            k=k_win,
-            v=v_win,
-            softmax_scale=softmax_scale)
-        y = y.view(f, hp // window, wp // window, window, window, n, d)
-        y = y.permute(0, 1, 3, 2, 4, 5, 6).reshape(f, hp, wp, n, d)
-        return y[:, :h, :w]
-
 
 class WanCrossAttention(WanSelfAttention):
 

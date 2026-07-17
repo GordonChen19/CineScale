@@ -146,12 +146,6 @@ def _vae_decoded_frame_count(latent_frames, temporal_stride=4):
     return (latent_frames - 1) * temporal_stride + 1
 
 
-def _vae_temporal_keep_range(latent_frames, temporal_pad, temporal_stride=4):
-    start = temporal_pad * temporal_stride
-    end = start + _vae_decoded_frame_count(latent_frames, temporal_stride)
-    return start, end
-
-
 def _linear_blend_1d(length, left_bound, right_bound, border_width, device,
                      dtype):
     weight = torch.ones((length,), device=device, dtype=dtype)
@@ -230,12 +224,21 @@ def prepare_text_context(model, prompt, negative_prompt, offload_model):
     return context, context_null
 
 
-def make_scheduler(model, sample_steps, shift):
-    from wan.utils.fm_solvers import (
-        FlowDPMSolverMultistepScheduler,
-        get_sampling_sigmas,
-        retrieve_timesteps,
-    )
+def make_unipc_scheduler(model, sample_steps, shift):
+    from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+
+    scheduler = FlowUniPCMultistepScheduler(
+        num_train_timesteps=model.num_train_timesteps,
+        shift=1,
+        use_dynamic_shifting=False)
+    scheduler.set_timesteps(sample_steps, device=model.device, shift=shift)
+    scheduler.sigmas = scheduler.sigmas.to(model.device)
+    return scheduler, scheduler.timesteps, scheduler.sigmas
+
+
+def make_dpmpp_scheduler(model, sample_steps, shift):
+    from wan.utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
+                                      get_sampling_sigmas, retrieve_timesteps)
 
     scheduler = FlowDPMSolverMultistepScheduler(
         num_train_timesteps=model.num_train_timesteps,
@@ -244,16 +247,31 @@ def make_scheduler(model, sample_steps, shift):
         use_dynamic_shifting=False)
     sampling_sigmas = get_sampling_sigmas(sample_steps, shift)
     timesteps, _ = retrieve_timesteps(
-        scheduler, device=model.device, sigmas=sampling_sigmas)
+        scheduler,
+        device=model.device,
+        sigmas=sampling_sigmas)
     scheduler.sigmas = scheduler.sigmas.to(model.device)
     return scheduler, timesteps, scheduler.sigmas
 
 
 def reset_scheduler_state(scheduler):
-    scheduler._step_index = None
-    scheduler._begin_index = None
-    scheduler.lower_order_nums = 0
-    scheduler.model_outputs = [None] * scheduler.config.solver_order
+    if hasattr(scheduler, "_step_index"):
+        scheduler._step_index = None
+    if hasattr(scheduler, "_begin_index"):
+        scheduler._begin_index = None
+    if hasattr(scheduler, "lower_order_nums"):
+        scheduler.lower_order_nums = 0
+    solver_order = getattr(getattr(scheduler, "config", None),
+                           "solver_order", None)
+    if solver_order is not None:
+        if hasattr(scheduler, "model_outputs"):
+            scheduler.model_outputs = [None] * solver_order
+        if hasattr(scheduler, "timestep_list"):
+            scheduler.timestep_list = [None] * solver_order
+    if hasattr(scheduler, "last_sample"):
+        scheduler.last_sample = None
+    if hasattr(scheduler, "this_order"):
+        scheduler.this_order = None
 
 
 def move_scheduler_to_device(scheduler, device):
@@ -271,7 +289,7 @@ def move_scheduler_to_device(scheduler, device):
 
 
 def set_block_tiled_self_attention(model, enabled, tile_height, tile_width,
-                                   stride_height, stride_width, halo,
+                                   stride_height, stride_width,
                                    routed_topk, routed_grid,
                                    global_rope_threshold,
                                    adaptive_rectified_rope):
@@ -279,8 +297,6 @@ def set_block_tiled_self_attention(model, enabled, tile_height, tile_width,
         raise ValueError(
             "Block tiled self-attention tile and stride dimensions must be positive."
         )
-    if enabled and halo < 0:
-        raise ValueError("--block_tiled_self_attn_halo must be non-negative.")
     if enabled and routed_topk < 0:
         raise ValueError(
             "--block_tiled_self_attn_routed_topk must be non-negative.")
@@ -299,7 +315,6 @@ def set_block_tiled_self_attention(model, enabled, tile_height, tile_width,
             block.self_attn.block_tiled_attn_tile_w = tile_width
             block.self_attn.block_tiled_attn_stride_h = stride_height
             block.self_attn.block_tiled_attn_stride_w = stride_width
-            block.self_attn.block_tiled_attn_halo = halo
             block.self_attn.block_tiled_attn_routed_topk = (
                 routed_topk if enabled else 0)
             block.self_attn.block_tiled_attn_routed_grid = routed_grid
@@ -307,8 +322,6 @@ def set_block_tiled_self_attention(model, enabled, tile_height, tile_width,
                 global_rope_threshold)
             block.self_attn.block_tiled_attn_adaptive_rectified_rope = (
                 adaptive_rectified_rope)
-            block.self_attn.full_attn_rectified_rope = False
-            block.self_attn.block_tiled_attn_full_global = False
 
     for _, dit_model in unique_dit_models(model):
         set_model_block_tiling(dit_model)
@@ -395,8 +408,8 @@ def resize_latent_input_to_size(model, latent, target_size):
         target_size)
 
 
-def load_input_latent(path):
-    latent, metadata = load_latent_payload(path)
+def load_input_latent(path, latent_key="prompt_base_latent"):
+    latent, metadata = load_latent_payload(path, latent_key)
     if not isinstance(latent, torch.Tensor):
         raise TypeError(f"{path} did not resolve to a latent tensor.")
     if latent.ndim != 4:
@@ -546,18 +559,6 @@ def denoise_trajectory(model,
 
     return latent, flow
 
-
-def save_latent_video_streaming(vae,
-                                latent,
-                                save_path,
-                                fps,
-                                temporal_pad=0,
-                                reflect_padding=False):
-    return save_latent_video_tiled(vae, latent, save_path, fps,
-                                   temporal_pad=temporal_pad,
-                                   reflect_padding=reflect_padding)
-
-
 def save_video_tensor(video, save_path, fps):
     try:
         import imageio
@@ -576,207 +577,68 @@ def save_video_tensor(video, save_path, fps):
     finally:
         writer.close()
 
-
-def decode_latent_wan(vae, latent):
-    with torch.no_grad():
-        return vae.decode([latent.to(vae.device)])[0]
-
-
-def save_latent_video_wan_decode(vae, latent, save_path, fps):
-    video = decode_latent_wan(vae, latent)
-    save_video_tensor(video, save_path, fps)
-    return video
-
-
-def _center_crop_or_pad_spatial_5d(x, target_h, target_w):
-    """
-    x: [B, C, T, H, W]
-    """
-    current_h, current_w = x.shape[-2:]
-
-    # Center crop.
-    if current_h > target_h:
-        top = (current_h - target_h) // 2
-        x = x[..., top:top + target_h, :]
-
-    if current_w > target_w:
-        left = (current_w - target_w) // 2
-        x = x[..., :, left:left + target_w]
-
-    # Symmetric padding only for unexpected undersized output.
-    current_h, current_w = x.shape[-2:]
-    pad_h = max(0, target_h - current_h)
-    pad_w = max(0, target_w - current_w)
-
-    if pad_h > 0 or pad_w > 0:
-        pad_top = pad_h // 2
-        pad_bottom = pad_h - pad_top
-        pad_left = pad_w // 2
-        pad_right = pad_w - pad_left
-
-        b, c, t, h, w = x.shape
-        x4 = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
-        x4 = F.pad(
-            x4,
-            (pad_left, pad_right, pad_top, pad_bottom),
-            mode="replicate",
-        )
-        x = (
-            x4.reshape(
-                b,
-                t,
-                c,
-                h + pad_h,
-                w + pad_w,
-            )
-            .permute(0, 2, 1, 3, 4)
-            .contiguous()
-        )
-
-    return x
-
-
 def decode_latent_to_video_tiled(vae,
                                  latent,
-                                 tile_h=90,
-                                 tile_w=160,
-                                 overlap=48,
-                                 tile_stride_h=48,
-                                 tile_stride_w=80,
-                                 temporal_pad=0,
-                                 reflect_padding=False):
-    stride_h = tile_stride_h if tile_stride_h is not None else tile_h - overlap
-    stride_w = tile_stride_w if tile_stride_w is not None else tile_w - overlap
-    if min(stride_h, stride_w) <= 0:
-        raise ValueError("VAE decode tile overlap must be smaller than tile size.")
-
+                                 tile_h=None,
+                                 tile_w=None,
+                                 stride_h=160,
+                                 stride_w=140):
+    
     vae_model = vae.model
     device = vae.device
-    unpadded_latent_frames = latent.shape[1]
-    keep_start, keep_end = _vae_temporal_keep_range(
-        unpadded_latent_frames, temporal_pad)
+    reflect_pad = 24
+
     z = latent.to(device).unsqueeze(0)
-    if temporal_pad > 0:
-        pad_start = z[:, :, :1].repeat(1, 1, temporal_pad, 1, 1)
-        pad_end = z[:, :, -1:].repeat(1, 1, temporal_pad, 1, 1)
-        z = torch.cat([pad_start, z, pad_end], dim=2)
+    _, _, latent_frames, latent_h, latent_w = z.shape
+    tile_h = latent_h if tile_h is None else min(tile_h, latent_h)
+    stride_h = tile_h if stride_h is None else min(stride_h, tile_h)
+    tile_w = latent_w if tile_w is None else min(tile_w, latent_w)
+    stride_w = tile_w if stride_w is None else min(stride_w, tile_w)
+    blend_h = tile_h - stride_h
+    blend_w = tile_w - stride_w
+    out_frames = _vae_decoded_frame_count(latent_frames)
+    out_h, out_w = latent_h * 8, latent_w * 8
 
-    try:
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=vae.dtype):
-            blend_h = tile_h - stride_h
-            blend_w = tile_w - stride_w
-            reflect_pad_h = (blend_h // 2 if reflect_padding else 0)
-            reflect_pad_w = (blend_w // 2 if reflect_padding else 0)
-            z, (reflect_pad_h, reflect_pad_w) = _reflect_pad_spatial_5d(
-                z, reflect_pad_h, reflect_pad_w)
-            _, _, latent_frames, padded_latent_h, padded_latent_w = z.shape
-            latent_h = padded_latent_h - 2 * reflect_pad_h
-            latent_w = padded_latent_w - 2 * reflect_pad_w
-            tasks = _vae_tile_tasks(latent_h, latent_w, tile_h, tile_w,
-                                    stride_h, stride_w)
-            out_frames = _vae_decoded_frame_count(latent_frames)
-            out_h = latent_h * 8
-            out_w = latent_w * 8
-            values = torch.zeros(
-                1,
-                3,
-                out_frames,
-                out_h,
-                out_w,
-                device="cpu",
-                dtype=torch.float32)
-            weights = torch.zeros(
-                1,
-                1,
-                out_frames,
-                out_h,
-                out_w,
-                device="cpu",
-                dtype=torch.float32)
-            pbar = tqdm(
-                total=len(tasks),
-                desc="VAE Decode",
-                unit="tile",
-                disable=not is_main_process())
 
-            try:
-                for y0, y1, x0, x1 in tasks:
-                    tile_y0 = y0
-                    tile_y1 = y1 + 2 * reflect_pad_h
-                    tile_x0 = x0
-                    tile_x1 = x1 + 2 * reflect_pad_w
-                    tile = z[:, :, :, tile_y0:tile_y1, tile_x0:tile_x1].to(device)
-                    tile_out = vae_model.decode(tile, vae.scale).float().cpu()
-                    core_h = (y1 - y0) * 8
-                    core_w = (x1 - x0) * 8
-                    crop_top = reflect_pad_h * 8
-                    crop_left = reflect_pad_w * 8
-                    tile_out = tile_out[
-                        ...,
-                        crop_top:crop_top + core_h,
-                        crop_left:crop_left + core_w,
-                    ]
-                    tile_out = _center_crop_or_pad_spatial_5d(
-                        tile_out, core_h, core_w)
-                    _, _, _, tile_out_h, tile_out_w = tile_out.shape
-                    out_y0 = y0 * 8
-                    out_x0 = x0 * 8
-                    out_y1 = out_y0 + tile_out_h
-                    out_x1 = out_x0 + tile_out_w
-                    mask = _linear_blend_mask(
-                        tile_out,
-                        is_bound=(y0 == 0, y1 >= latent_h, x0 == 0,
-                                  x1 >= latent_w),
-                        border_width=(blend_h * 8, blend_w * 8)).float().cpu()
-                    values[:, :, :, out_y0:out_y1,
-                           out_x0:out_x1] += tile_out * mask
-                    weights[:, :, :, out_y0:out_y1,
-                            out_x0:out_x1] += mask
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=vae.dtype):
 
-                    del tile, tile_out, mask
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    pbar.update(1)
-            finally:
-                pbar.close()
+        z, (pad_h, pad_w) = _reflect_pad_spatial_5d(z, reflect_pad, reflect_pad)
+        tasks = _vae_tile_tasks(latent_h, latent_w, tile_h, tile_w, stride_h, stride_w)
 
-    except torch.OutOfMemoryError:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        if tile_h <= 48 or tile_w <= 48:
-            vae_model.clear_cache()
-            raise
-        logging.warning(
-            "Tiled VAE decode OOM at %dx%d latent tiles. Retrying with %dx%d tiles.",
-            tile_h, tile_w, max(48, tile_h // 2), max(48, tile_w // 2))
-        vae_model.clear_cache()
-        return decode_latent_to_video_tiled(
-            vae,
-            latent,
-            tile_h=max(48, tile_h // 2),
-            tile_w=max(48, tile_w // 2),
-            overlap=min(12, max(0, max(48, tile_h // 2) - 1),
-                        max(0, max(48, tile_w // 2) - 1)),
-            tile_stride_h=None,
-            tile_stride_w=None,
-            temporal_pad=temporal_pad,
-            reflect_padding=reflect_padding)
-    finally:
-        vae_model.clear_cache()
+        values = torch.zeros(1, 3, out_frames, out_h, out_w, dtype=torch.float32)
+        weights = torch.zeros(1, 1, out_frames, out_h, out_w, dtype=torch.float32)
 
-    video = (values / weights.clamp_min(1e-6)).clamp_(-1, 1).squeeze(0)
-    return video[:, keep_start:keep_end].contiguous()
+        for y0, y1, x0, x1 in tqdm(tasks, desc="VAE Decode", unit="tile",
+                                    disable=not is_main_process()):
+            tile = z[:, :, :, y0:y1 + 2 * pad_h, x0:x1 + 2 * pad_w].to(device)
+            tile_out = vae_model.decode(tile, vae.scale).float().cpu()
+            core_h, core_w = (y1 - y0) * 8, (x1 - x0) * 8
+            tile_out = tile_out[..., pad_h * 8:pad_h * 8 + core_h,
+                                     pad_w * 8:pad_w * 8 + core_w]
+
+            out_y0, out_x0 = y0 * 8, x0 * 8
+            mask = _linear_blend_mask(
+                tile_out,
+                is_bound=(y0 == 0, y1 >= latent_h, x0 == 0, x1 >= latent_w),
+                border_width=(blend_h * 8, blend_w * 8)).float().cpu()
+            values[:, :, :, out_y0:out_y0 + core_h, out_x0:out_x0 + core_w] += tile_out * mask
+            weights[:, :, :, out_y0:out_y0 + core_h, out_x0:out_x0 + core_w] += mask
+
+            del tile, tile_out, mask
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    vae_model.clear_cache()
+    return (values / weights.clamp_min(1e-6)).clamp_(-1, 1).squeeze(0).contiguous()
 
 
 def save_latent_video_tiled(vae,
                             latent,
                             save_path,
                             fps,
-                            tile_h=96,
-                            tile_w=96,
-                            overlap=48,
-                            temporal_pad=0,
-                            reflect_padding=False):
+                            tile_h=None,
+                            tile_w=128):
+    
     try:
         import imageio
     except ImportError as exc:
@@ -784,48 +646,18 @@ def save_latent_video_tiled(vae,
             "Saving videos requires imageio. Install Wan2.2 requirements in "
             "the active environment, e.g. `pip install -r Wan2.2/requirements.txt`."
         ) from exc
-
-    if temporal_pad < 0:
-        raise ValueError("VAE decode temporal padding must be non-negative.")
-
+    
     writer = imageio.get_writer(save_path, fps=fps, codec="libx264", quality=8)
-    try:
-        video = decode_latent_to_video_tiled(
-            vae,
-            latent,
-            tile_h=tile_h,
-            tile_w=tile_w,
-            overlap=overlap,
-            temporal_pad=temporal_pad,
-            reflect_padding=reflect_padding)
-        for frame in video.unbind(1):
-            frame = ((frame.float() + 1.0) * 127.5).clamp_(0, 255)
-            frame = frame.to(torch.uint8).permute(1, 2, 0).cpu().numpy()
-            writer.append_data(frame)
-
-    except torch.OutOfMemoryError:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        if tile_h <= 48 or tile_w <= 48:
-            writer.close()
-            raise
-        logging.warning(
-            "Tiled VAE decode OOM at %dx%d latent tiles. Retrying with %dx%d tiles.",
-            tile_h, tile_w, max(48, tile_h // 2), max(48, tile_w // 2))
-        writer.close()
-        return save_latent_video_tiled(
-            vae,
-            latent,
-            save_path,
-            fps,
-            tile_h=max(48, tile_h // 2),
-            tile_w=max(48, tile_w // 2),
-            overlap=min(12, max(0, max(48, tile_h // 2) - 1),
-                        max(0, max(48, tile_w // 2) - 1)),
-            temporal_pad=temporal_pad,
-            reflect_padding=reflect_padding)
-    finally:
-        writer.close()
+    video = decode_latent_to_video_tiled(
+        vae,
+        latent,
+        tile_h=tile_h,
+        tile_w=tile_w)
+    for frame in video.unbind(1):
+        frame = ((frame.float() + 1.0) * 127.5).clamp_(0, 255)
+        frame = frame.to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+        writer.append_data(frame)
+    writer.close()        
 
 def load_latent_payload(path, latent_key="final_latent"):
     payload = torch.load(path, map_location="cpu")
@@ -835,25 +667,6 @@ def load_latent_payload(path, latent_key="final_latent"):
                 f"{path} is a raw tensor, so --decode_latent_key must be 'tensor' or 'final_latent'.")
         return payload, {}
     metadata = dict(payload.get("metadata", {}))
-
-    if latent_key.startswith("round_latents:"):
-        round_id = int(latent_key.split(":", 1)[1])
-        for item in payload.get("round_latents", []):
-            if item.get("round") == round_id:
-                metadata["decoded_latent_key"] = latent_key
-                metadata["decoded_round"] = round_id
-                return item["latent"], metadata
-        raise KeyError(
-            f"{path} does not contain round_latents entry for round {round_id}.")
-
-    if latent_key == "round_latents":
-        round_latents = payload.get("round_latents", [])
-        if not round_latents:
-            raise KeyError(f"{path} does not contain any round_latents.")
-        item = round_latents[-1]
-        metadata["decoded_latent_key"] = latent_key
-        metadata["decoded_round"] = item.get("round")
-        return item["latent"], metadata
 
     if latent_key in payload:
         latent = payload[latent_key]
@@ -899,15 +712,13 @@ def decode_latent_only(args, cfg):
         device=torch.device(f"cuda:{local_rank}"))
     set_vae_dtype(vae, vae_dtype)
     if metadata.get("decoded_latent_key") == "prompt_base_latent":
-        save_latent_video_wan_decode(vae, latent, args.save_video, fps)
+        with torch.no_grad():
+            video = vae.decode([latent.to(vae.device)])[0]
+        save_video_tensor(video, args.save_video, fps)
     else:
-        save_latent_video_streaming(
-            vae,
-            latent,
-            args.save_video,
-            fps,
-            0,
-            reflect_padding=args.vae_reflect_padding)
+        save_latent_video_tiled(vae, latent, args.save_video, fps)
+
+    
     logging.info("Decoded %s:%s to %s", args.decode_latent,
                  metadata.get("decoded_latent_key", args.decode_latent_key),
                  args.save_video)
@@ -917,7 +728,7 @@ def run(args, model, cfg):
     if args.video is None and args.prompt is None:
         raise ValueError(
             "--prompt is required when --video is not provided.")
-    if (args.prompt is None):
+    if args.prompt is None:
         raise ValueError("--prompt is required unless --decode_latent is set.")
 
     frame_num = args.frame_num or cfg.frame_num
@@ -931,15 +742,17 @@ def run(args, model, cfg):
 
     if frame_num % 4 != 1:
         raise ValueError("--frame_num must be 4n+1 for Wan T2V.")
-    if args.noise_rounds < 1:
-        raise ValueError("--noise_rounds must be at least 1.")
+   
     encode_size = args.size
 
+    context = context_null = None
+    restart_scheduler = restart_timesteps = restart_sigmas = None
+   
     context, context_null = prepare_text_context(model, args.prompt,
-                                                     args.negative_prompt,
-                                                     text_offload_model)
-    scheduler, timesteps, sigmas = make_scheduler(model, sample_steps,
-                                                  sample_shift)
+                                                        args.negative_prompt,
+                                                        text_offload_model)
+    restart_scheduler, restart_timesteps, restart_sigmas = make_dpmpp_scheduler(
+        model, sample_steps, sample_shift)
 
     def configure_block_tiled_attention(enabled):
         set_block_tiled_self_attention(
@@ -949,7 +762,6 @@ def run(args, model, cfg):
             args.block_tiled_self_attn_tile_width,
             args.block_tiled_self_attn_stride_height,
             args.block_tiled_self_attn_stride_width,
-            args.block_tiled_self_attn_halo,
             args.block_tiled_self_attn_routed_topk,
             args.block_tiled_self_attn_routed_grid,
             args.block_tiled_self_attn_global_rope_threshold,
@@ -963,6 +775,8 @@ def run(args, model, cfg):
         if is_main_process():
             logging.info("Generating prompt-only base latent at %s",
                          prompt_base_size)
+        base_scheduler, base_timesteps, base_sigmas = make_unipc_scheduler(
+            model, sample_steps, sample_shift)
         configure_block_tiled_attention_for_base = False
         set_block_tiled_self_attention(
             model,
@@ -971,7 +785,6 @@ def run(args, model, cfg):
             args.block_tiled_self_attn_tile_width,
             args.block_tiled_self_attn_stride_height,
             args.block_tiled_self_attn_stride_width,
-            args.block_tiled_self_attn_halo,
             args.block_tiled_self_attn_routed_topk,
             args.block_tiled_self_attn_routed_grid,
             args.block_tiled_self_attn_global_rope_threshold,
@@ -982,21 +795,20 @@ def run(args, model, cfg):
             context=context,
             context_null=context_null,
             seq_len=base_seq_len,
-            scheduler=scheduler,
-            timesteps=timesteps,
-            sigmas=sigmas,
+            scheduler=base_scheduler,
+            timesteps=base_timesteps,
+            sigmas=base_sigmas,
             sample_steps=sample_steps,
             start_index=0,
             guide_scale=guide_scale,
             offload_model=step_offload_model,
             y=None)
+        del base_scheduler, base_timesteps, base_sigmas
         if args.save_latent is not None and is_main_process():
             prompt_base_latent_cpu = base_latent.detach().cpu()
             prompt_base_payload = {
                 "final_latent": None,
-                "initial_latent": None,
                 "prompt_base_latent": prompt_base_latent_cpu,
-                "round_latents": [],
                 "metadata": {"fps": args.fps},
             }
             Path(args.save_latent).parent.mkdir(parents=True, exist_ok=True)
@@ -1017,7 +829,8 @@ def run(args, model, cfg):
         del base_latent
         metadata["input_mode"] = "prompt"
     else:
-        source_latent, source_metadata = load_input_latent(args.video)
+        source_latent, source_metadata = load_input_latent(
+            args.video, args.decode_latent_key)
         clean_latent, resize_metadata = resize_latent_input_to_size(
             model, source_latent, encode_size)
         seq_len = compute_seq_len(model, clean_latent.shape)
@@ -1029,7 +842,7 @@ def run(args, model, cfg):
             "input_mode": "latent",
             "input_latent": args.video,
             "input_latent_key": source_metadata.get("decoded_latent_key",
-                                                    "final_latent"),
+                                                    args.decode_latent_key),
             "input_latent_shape": tuple(source_latent.shape),
             "input_latent_size": source_size,
             "input_resize_mode": "latent",
@@ -1063,45 +876,30 @@ def run(args, model, cfg):
     no_sync_high = (
         noop_no_sync if model.high_noise_model is model.low_noise_model else
         getattr(model.high_noise_model, "no_sync", noop_no_sync))
-    restart_latents = []
     final_latent = clean_latent.detach()
-    initial_latent_cpu = (
-        final_latent.detach().cpu()
-        if args.save_latent is not None and is_main_process() else None)
     with no_sync_low(), no_sync_high():
-        for restart_idx in range(args.noise_rounds):
-            if is_main_process():
-                logging.info("Noise restart %d/%d: adding noise and denoising %d steps",
-                             restart_idx + 1, args.noise_rounds,
-                             args.round_noise_steps)
-            final_latent, start_index = denoise(
-                model=model,
-                clean_latent=final_latent,
-                round_noise_steps=args.round_noise_steps,
-                context=context,
-                context_null=context_null,
-                seq_len=seq_len,
-                scheduler=scheduler,
-                timesteps=timesteps,
-                sigmas=sigmas,
-                sample_steps=sample_steps,
-                guide_scale=guide_scale,
-                offload_model=step_offload_model,
-                y=None)
-            if args.save_latent is not None and is_main_process():
-                restart_latents.append({
-                    "round": restart_idx + 1,
-                    "latent": final_latent.detach().cpu(),
-                })
+        final_latent, start_index = denoise(
+            model=model,
+            clean_latent=final_latent,
+            round_noise_steps=args.round_noise_steps,
+            context=context,
+            context_null=context_null,
+            seq_len=seq_len,
+            scheduler=restart_scheduler,
+            timesteps=restart_timesteps,
+            sigmas=restart_sigmas,
+            sample_steps=sample_steps,
+            guide_scale=guide_scale,
+            offload_model=step_offload_model,
+            y=None)
+
     if args.offload_model:  
         offload_dit_models(model)
 
     if args.save_latent is not None and is_main_process():
         payload = {
             "final_latent": final_latent.detach().cpu(),
-            "initial_latent": initial_latent_cpu,
             "prompt_base_latent": prompt_base_latent_cpu,
-            "round_latents": restart_latents,
             "metadata": {"fps": args.fps},
         }
         Path(args.save_latent).parent.mkdir(parents=True, exist_ok=True)
@@ -1111,13 +909,13 @@ def run(args, model, cfg):
     if args.save_video is not None and is_main_process():
         Path(args.save_video).parent.mkdir(parents=True, exist_ok=True)
         model.vae.model.to(device=model.vae.device, dtype=model.vae.dtype)
-        save_latent_video_streaming(model.vae, final_latent, args.save_video,
-                                    args.fps, 0,
-                                    reflect_padding=args.vae_reflect_padding)
+        save_latent_video_tiled(model.vae, final_latent, args.save_video,
+                                    args.fps)
+        
         logging.info("Decoded final latent to %s", args.save_video)
 
     del clean_latent, context, context_null
-    del timesteps, sigmas
+    del restart_scheduler, restart_timesteps, restart_sigmas
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -1144,18 +942,12 @@ def parse_args():
     parser.add_argument(
         "--decode_latent_key",
         default="final_latent",
-        help="Which tensor to decode from a saved latent .pt: final_latent, prompt_base_latent, initial_latent, round_latents, or round_latents:N.")
-
+        help="Which tensor to decode from a saved latent .pt: final_latent, prompt_base_latent.")
     parser.add_argument(
         "--vae_dtype",
         default="fp16",
         choices=("fp32", "fp16", "bf16"),
         help="VAE encode/decode dtype.")
-    parser.add_argument(
-        "--vae_reflect_padding",
-        type=str2bool,
-        default=False,
-        help="Opt-in spatial reflection padding for tiled VAE decode. Padded borders are cropped before blending.")
     parser.add_argument("--fps", type=int, default=16)
     parser.add_argument(
         "--size",
@@ -1168,11 +960,6 @@ def parse_args():
         type=int,
         default=30,
         help="Exact denoising steps per noise round.")
-    parser.add_argument(
-        "--noise_rounds",
-        type=int,
-        default=1,
-        help="Number of repeated noise restart cycles. Each cycle adds fresh noise to the current latent and denoises --round_noise_steps steps.")
     parser.add_argument("--sample_shift", type=float, default=12.0)
     parser.add_argument("--sample_guide_scale", type=float, default=None)
     parser.add_argument("--negative_prompt", default="")
@@ -1206,11 +993,6 @@ def parse_args():
         type=int,
         default=15,
         help="Self-attention tile stride width in transformer patch-token units.")
-    parser.add_argument(
-        "--block_tiled_self_attn_halo",
-        type=int,
-        default=5,
-        help="Halo context in transformer patch-token units for blockwise tiled self-attention.")
     parser.add_argument(
         "--block_tiled_self_attn_routed_topk",
         type=int,
@@ -1319,21 +1101,19 @@ if __name__ == "__main__":
 #   --decode_latent CineScale/latent_result.pt \
 #   --ckpt_dir Wan2.2-T2V-A14B \
 #   --decode_latent_key prompt_base_latent \
-#   --save_video CineScale/base_with_padding.mp4  
+#   --save_video CineScale/base_result.mp4  
 
 # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # python CineScale/Wan2.2/cinescale.py \
 #   --decode_latent CineScale/4k_result.pt \
-#   --vae_reflect_padding true \
 #   --ckpt_dir Wan2.2-T2V-A14B \
-#   --save_video CineScale/result.mp4  
-
-# --video CineScale/base_result.pt \
+#   --save_video CineScale/base_result.mp4  
 
 # CUDA_VISIBLE_DEVICES=0,1,2,3 \
 # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 # torchrun --standalone --nproc_per_node=4 CineScale/Wan2.2/cinescale.py \
-#   --vae_reflect_padding true \
+#   --video CineScale/4k_result.pt \
+#   --decode_latent_key prompt_base_latent \
 #   --size "3840*2160" \
 #   --prompt "Dusk time, soft lighting, side lighting, low contrast lighting, medium long shot, balanced composition, warm colors, two shot, daylight.A graceful Mongolian woman is performing the **bowl dance** on a vast grassland. She is wearing a bright red Mongolian robe embroidered with cloud and floral patterns, a wide silk sash at her waist, and a traditional hat with an exquisite headdress, her expression focused. As the camera moves to the left, she balances six porcelain bowls stacked on her head. Her steps are steady, and her arms sway like waves as she performs soft arm and shoulder shake movements. Simultaneously, she executes backbends, spins, and small jumps with movements that are both elegant and powerful. The background is a vast grassland with several yurts, and golden sunlight falls on the scene, creating a warm and magnificent atmosphere." \
 #   --ckpt_dir Wan2.2-T2V-A14B \
@@ -1341,16 +1121,14 @@ if __name__ == "__main__":
 #   --round_noise_steps 25 \
 #   --sample_shift 12 \
 #   --block_tiled_self_attn true \
-#   --block_tiled_self_attn_tile_height 20 \
-#   --block_tiled_self_attn_tile_width 20 \
-#   --block_tiled_self_attn_stride_height 15 \
-#   --block_tiled_self_attn_stride_width 15 \
-#   --block_tiled_self_attn_halo 5 \
-#  --block_tiled_self_attn_routed_topk 16 \
-#   --block_tiled_self_attn_routed_grid 10 \
+#   --block_tiled_self_attn_tile_height 30 \
+#   --block_tiled_self_attn_tile_width 30 \
+#   --block_tiled_self_attn_stride_height 30 \
+#   --block_tiled_self_attn_stride_width 30 \
+#  --block_tiled_self_attn_routed_topk 8 \
+#   --block_tiled_self_attn_routed_grid 15 \
 # --block_tiled_self_attn_global_rope_threshold 20 \
 #   --save_latent CineScale/4k_result.pt \
-# --noise_rounds 1 \
 #   --ulysses_size 4 \
 #   --dit_fsdp \
 #   --t5_cpu \

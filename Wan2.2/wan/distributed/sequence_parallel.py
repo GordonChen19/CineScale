@@ -22,59 +22,6 @@ def pad_freqs(original_tensor, target_len):
     return padded_tensor
 
 
-def _rectified_positions(length, train_length, threshold, device):
-    center = (length - 1) / 2.0
-    target_center = (train_length - 1) / 2.0
-    max_pos = float(length - 1)
-    train_max_pos = float(train_length - 1)
-    total = 2.0 * threshold
-
-    neg_room = max(center, 0.0)
-    pos_room = max(max_pos - center, 0.0)
-    target_neg_room = max(target_center, 0.0)
-    target_pos_room = max(train_max_pos - target_center, 0.0)
-
-    t_neg = min(threshold, neg_room)
-    t_pos = min(threshold, pos_room)
-    unused = total - (t_neg + t_pos)
-
-    pos_extra = min(unused, max(pos_room - t_pos, 0.0))
-    t_pos += pos_extra
-    unused -= pos_extra
-
-    neg_extra = min(unused, max(neg_room - t_neg, 0.0))
-    t_neg += neg_extra
-
-    t_neg = min(t_neg, target_neg_room)
-    t_pos = min(t_pos, target_pos_room)
-
-    def side_compression(full_room, target_room, side_threshold):
-        full_tail = max(float(full_room) - float(side_threshold), 0.0)
-        target_tail = max(float(target_room) - float(side_threshold), 0.0)
-        if full_tail <= target_tail or full_tail <= 0:
-            return 1.0
-        if target_tail <= 1e-6:
-            return 1e6
-        return full_tail / target_tail
-
-    s_neg = side_compression(neg_room, target_neg_room, t_neg)
-    s_pos = side_compression(pos_room, target_pos_room, t_pos)
-
-    pos = torch.arange(length, device=device, dtype=torch.float32)
-    delta = pos - center
-    t_neg = torch.tensor(t_neg, device=device, dtype=torch.float32)
-    t_pos = torch.tensor(t_pos, device=device, dtype=torch.float32)
-    s_neg = torch.tensor(s_neg, device=device, dtype=torch.float32)
-    s_pos = torch.tensor(s_pos, device=device, dtype=torch.float32)
-    warped = torch.where(
-        delta < -t_neg,
-        -(t_neg + (delta.abs() - t_neg) / s_neg),
-        torch.where(delta > t_pos,
-                    t_pos + (delta - t_pos) / s_pos, delta))
-    return torch.round(target_center + warped).long().clamp(
-        0, int(train_max_pos))
-
-
 @torch.amp.autocast('cuda', enabled=False)
 def rope_apply(x, grid_sizes, freqs):
     """
@@ -112,48 +59,6 @@ def rope_apply(x, grid_sizes, freqs):
         x_i = torch.cat([x_i, x[i, s:]])
 
         # append to collection
-        output.append(x_i)
-    return torch.stack(output).float()
-
-
-@torch.amp.autocast('cuda', enabled=False)
-def rope_apply_full_rectified(x,
-                              grid_sizes,
-                              freqs,
-                              threshold,
-                              train_720_h=45,
-                              train_720_w=80):
-    """
-    Sequence-parallel full-attention RoPE with spatial coordinates compressed
-    into Wan's 720p training coordinate range before rank slicing.
-    """
-    s, n, c = x.size(1), x.size(2), x.size(3) // 2
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-
-    output = []
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        seq_len = f * h * w
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(
-            s, n, -1, 2))
-        y_idx = _rectified_positions(
-            h, train_720_h, threshold, x.device).clamp(0, freqs[1].shape[0] - 1)
-        x_idx = _rectified_positions(
-            w, train_720_w, threshold, x.device).clamp(0, freqs[2].shape[0] - 1)
-        freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][y_idx].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][x_idx].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                            dim=-1).reshape(seq_len, 1, -1)
-
-        sp_size = get_world_size()
-        sp_rank = get_rank()
-        freqs_i = pad_freqs(freqs_i, s * sp_size)
-        s_per_rank = s
-        freqs_i_rank = freqs_i[(sp_rank * s_per_rank):((sp_rank + 1) *
-                                                       s_per_rank), :, :]
-        x_i = torch.view_as_real(x_i * freqs_i_rank).flatten(2)
-        x_i = torch.cat([x_i, x[i, s:]])
         output.append(x_i)
     return torch.stack(output).float()
 
@@ -256,7 +161,7 @@ def sp_dit_forward(
 
 
 def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
-    b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+    s, n, d = x.shape[1], self.num_heads, self.head_dim
     half_dtypes = (torch.float16, torch.bfloat16)
 
     def half(x):
@@ -264,29 +169,40 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
 
     # query, key, value function
     def qkv_fn(x):
-        q = self.norm_q(self.q(x)).view(b, s, n, d)
-        k = self.norm_k(self.k(x)).view(b, s, n, d)
-        v = self.v(x).view(b, s, n, d)
+        input_b, input_s = x.shape[:2]
+        q = self.norm_q(self.q(x)).view(input_b, input_s, n, d)
+        k = self.norm_k(self.k(x)).view(input_b, input_s, n, d)
+        v = self.v(x).view(input_b, input_s, n, d)
         return q, k, v
 
-    q, k, v = qkv_fn(x)
-    if getattr(self, "full_attn_rectified_rope", False):
-        threshold = getattr(self, "block_tiled_attn_global_rope_threshold",
-                            24.0)
-        q = rope_apply_full_rectified(q, grid_sizes, freqs, threshold)
-        k = rope_apply_full_rectified(k, grid_sizes, freqs, threshold)
+    if getattr(self, "block_tiled_attn_enabled", False):
+        # Tiled attention needs the full spatial grid. Gather the hidden
+        # sequence, but project Q/K/V only for owned tiles to avoid replicating
+        # full-resolution attention tensors on every rank.
+        x_full = gather_forward(x, dim=1)
+        x_full = self.block_tiled_self_attention(
+            None,
+            None,
+            None,
+            seq_lens,
+            grid_sizes,
+            freqs,
+            hidden_states=x_full)
+        rank = get_rank()
+        x = x_full[:, rank * s:(rank + 1) * s].contiguous()
     else:
+        q, k, v = qkv_fn(x)
         q = rope_apply(q, grid_sizes, freqs)
         k = rope_apply(k, grid_sizes, freqs)
 
-    x = distributed_attention(
-        half(q),
-        half(k),
-        half(v),
-        seq_lens,
-        window_size=self.window_size,
-        softmax_scale=self.attn_scale / math.sqrt(d),
-    )
+        x = distributed_attention(
+            half(q),
+            half(k),
+            half(v),
+            seq_lens,
+            window_size=self.window_size,
+            softmax_scale=1 / math.sqrt(d),
+        )
 
     # output
     x = x.flatten(2)

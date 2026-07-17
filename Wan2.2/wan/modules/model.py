@@ -2,6 +2,7 @@
 import math
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
@@ -66,91 +67,6 @@ def rope_apply(x, grid_sizes, freqs):
     return torch.stack(output).float()
 
 
-def _rectified_positions(length, train_length, threshold, device):
-    center = (length - 1) / 2.0
-    target_center = (train_length - 1) / 2.0
-    max_pos = float(length - 1)
-    train_max_pos = float(train_length - 1)
-    total = 2.0 * threshold
-
-    neg_room = max(center, 0.0)
-    pos_room = max(max_pos - center, 0.0)
-    target_neg_room = max(target_center, 0.0)
-    target_pos_room = max(train_max_pos - target_center, 0.0)
-
-    t_neg = min(threshold, neg_room)
-    t_pos = min(threshold, pos_room)
-    unused = total - (t_neg + t_pos)
-
-    pos_extra = min(unused, max(pos_room - t_pos, 0.0))
-    t_pos += pos_extra
-    unused -= pos_extra
-
-    neg_extra = min(unused, max(neg_room - t_neg, 0.0))
-    t_neg += neg_extra
-
-    t_neg = min(t_neg, target_neg_room)
-    t_pos = min(t_pos, target_pos_room)
-
-    def side_compression(full_room, target_room, side_threshold):
-        full_tail = max(float(full_room) - float(side_threshold), 0.0)
-        target_tail = max(float(target_room) - float(side_threshold), 0.0)
-        if full_tail <= target_tail or full_tail <= 0:
-            return 1.0
-        if target_tail <= 1e-6:
-            return 1e6
-        return full_tail / target_tail
-
-    s_neg = side_compression(neg_room, target_neg_room, t_neg)
-    s_pos = side_compression(pos_room, target_pos_room, t_pos)
-
-    pos = torch.arange(length, device=device, dtype=torch.float32)
-    delta = pos - center
-    t_neg = torch.tensor(t_neg, device=device, dtype=torch.float32)
-    t_pos = torch.tensor(t_pos, device=device, dtype=torch.float32)
-    s_neg = torch.tensor(s_neg, device=device, dtype=torch.float32)
-    s_pos = torch.tensor(s_pos, device=device, dtype=torch.float32)
-    warped = torch.where(
-        delta < -t_neg,
-        -(t_neg + (delta.abs() - t_neg) / s_neg),
-        torch.where(delta > t_pos,
-                    t_pos + (delta - t_pos) / s_pos, delta))
-    return torch.round(target_center + warped).long().clamp(
-        0, int(train_max_pos))
-
-
-@torch.amp.autocast('cuda', enabled=False)
-def rope_apply_full_rectified(x,
-                              grid_sizes,
-                              freqs,
-                              threshold,
-                              train_720_h=45,
-                              train_720_w=80):
-    n, c = x.size(2), x.size(3) // 2
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-
-    output = []
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        seq_len = f * h * w
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        y_idx = _rectified_positions(
-            h, train_720_h, threshold, x.device).clamp(0, freqs[1].shape[0] - 1)
-        x_idx = _rectified_positions(
-            w, train_720_w, threshold, x.device).clamp(0, freqs[2].shape[0] - 1)
-        freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][y_idx].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][x_idx].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                            dim=-1).reshape(seq_len, 1, -1)
-
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
-        output.append(x_i)
-    return torch.stack(output).float()
-
-
 class WanRMSNorm(nn.Module):
 
     def __init__(self, dim, eps=1e-5):
@@ -204,14 +120,11 @@ class WanSelfAttention(nn.Module):
         self.block_tiled_attn_tile_w = 0
         self.block_tiled_attn_stride_h = 0
         self.block_tiled_attn_stride_w = 0
-        self.block_tiled_attn_halo = 0
         self.block_tiled_attn_global_stride = 0
         self.block_tiled_attn_routed_topk = 0
         self.block_tiled_attn_routed_grid = 3
         self.block_tiled_attn_global_rope_threshold = 24.0
         self.block_tiled_attn_adaptive_rectified_rope = True
-        self.block_tiled_attn_full_global = False
-        self.full_attn_rectified_rope = False
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -238,23 +151,19 @@ class WanSelfAttention(nn.Module):
             v = self.v(x).view(b, s, n, d)
             return q, k, v
 
-        q, k, v = qkv_fn(x)
-
         if self.block_tiled_attn_enabled:
-            x = self.block_tiled_self_attention(q, k, v, seq_lens,
-                                                grid_sizes, freqs)
+            x = self.block_tiled_self_attention(
+                None,
+                None,
+                None,
+                seq_lens,
+                grid_sizes,
+                freqs,
+                hidden_states=x)
         else:
-            if self.full_attn_rectified_rope:
-                q = rope_apply_full_rectified(
-                    q, grid_sizes, freqs,
-                    self.block_tiled_attn_global_rope_threshold)
-                k = rope_apply_full_rectified(
-                    k, grid_sizes, freqs,
-                    self.block_tiled_attn_global_rope_threshold)
-            else:
-                q = rope_apply(q, grid_sizes, freqs)
-                k = rope_apply(k, grid_sizes, freqs)
-
+            q, k, v = qkv_fn(x)
+            q = rope_apply(q, grid_sizes, freqs)
+            k = rope_apply(k, grid_sizes, freqs)
             x = flash_attention(
                 q=q,
                 k=k,
@@ -268,22 +177,38 @@ class WanSelfAttention(nn.Module):
         x = self.o(x)
         return x
 
-    def block_tiled_self_attention(self, q, k, v, seq_lens, grid_sizes, freqs):
-        out = torch.zeros_like(v)
+    def block_tiled_self_attention(self,
+                                   q,
+                                   k,
+                                   v,
+                                   seq_lens,
+                                   grid_sizes,
+                                   freqs,
+                                   hidden_states=None):
+        project_from_hidden = hidden_states is not None
+        if project_from_hidden:
+            b, s = hidden_states.shape[:2]
+            out = hidden_states.new_zeros(
+                b, s, self.num_heads, self.head_dim)
+            attn_device = hidden_states.device
+        else:
+            if q is None or k is None or v is None:
+                raise ValueError(
+                    "Tiled attention requires either hidden states or Q/K/V.")
+            out = torch.zeros_like(v)
+            attn_device = v.device
         scale = 1.0 / math.sqrt(self.head_dim)
         tile_h = self.block_tiled_attn_tile_h
         tile_w = self.block_tiled_attn_tile_w
         stride_h = self.block_tiled_attn_stride_h
         stride_w = self.block_tiled_attn_stride_w
-        halo = self.block_tiled_attn_halo
         global_stride = self.block_tiled_attn_global_stride
         routed_topk = self.block_tiled_attn_routed_topk
         routed_grid = self.block_tiled_attn_routed_grid
         rope_threshold = self.block_tiled_attn_global_rope_threshold
         adaptive_rectified_rope = self.block_tiled_attn_adaptive_rectified_rope
-        full_global_attention = self.block_tiled_attn_full_global
-        train_720_h = 45
-        train_720_w = 80
+        train_720_h = 68
+        train_720_w = 120
         if min(tile_h, tile_w, stride_h, stride_w) <= 0:
             raise ValueError("Block tiled self-attention tile/stride values must be positive.")
         if global_stride < 0:
@@ -338,14 +263,10 @@ class WanSelfAttention(nn.Module):
             return x_out.float().type_as(x)
 
 
-        def directional_thresholds(center, max_pos, target_center,
-                                   target_max_pos):
+        def directional_thresholds(center, max_pos):
             total = 2.0 * rope_threshold
             neg_room = max(float(center), 0.0)
             pos_room = max(float(max_pos) - float(center), 0.0)
-            target_neg_room = max(float(target_center), 0.0)
-            target_pos_room = max(
-                float(target_max_pos) - float(target_center), 0.0)
 
             t_neg = min(rope_threshold, neg_room)
             t_pos = min(rope_threshold, pos_room)
@@ -357,12 +278,42 @@ class WanSelfAttention(nn.Module):
 
             neg_extra = min(unused, max(neg_room - t_neg, 0.0))
             t_neg += neg_extra
-
-            # Keep the uncompressed region itself inside the Wan2.2 720p RoPE
-            # coordinate range. This matters near tile/canvas edges.
-            t_neg = min(t_neg, target_neg_room)
-            t_pos = min(t_pos, target_pos_room)
             return t_neg, t_pos
+
+        def proportional_target_center(full_center, local_neg_room,
+                                       local_pos_room, max_pos,
+                                       train_max_pos):
+            t_neg, t_pos = directional_thresholds(full_center, max_pos)
+            required_neg_room = max(float(local_neg_room), t_neg)
+            required_pos_room = max(float(local_pos_room), t_pos)
+            if required_neg_room + required_pos_room > float(train_max_pos):
+                raise ValueError(
+                    "The tile and uncompressed global RoPE threshold do not "
+                    "fit inside the training RoPE range. Reduce the tile size "
+                    "or --block_tiled_self_attn_global_rope_threshold.")
+
+            if max_pos <= 0:
+                raw_center = 0.0
+            else:
+                raw_center = (
+                    float(full_center) / float(max_pos) *
+                    float(train_max_pos))
+            min_center = required_neg_room
+            max_center = float(train_max_pos) - required_pos_room
+
+            # Preserve the source center's integer/half-integer phase so
+            # consecutive local tokens map to consecutive RoPE indices.
+            phase = float(full_center) - math.floor(float(full_center))
+            min_lattice = math.ceil(min_center - phase)
+            max_lattice = math.floor(max_center - phase)
+            if min_lattice > max_lattice:
+                raise ValueError(
+                    "No phase-aligned target center fits inside the training "
+                    "RoPE range. Reduce the tile size or global threshold.")
+            center_lattice = round(raw_center - phase)
+            center_lattice = min(max(center_lattice, min_lattice),
+                                 max_lattice)
+            return float(center_lattice) + phase
 
         def side_compression(full_room, target_room, threshold):
             full_tail = max(float(full_room) - float(threshold), 0.0)
@@ -373,14 +324,10 @@ class WanSelfAttention(nn.Module):
                 return 1e6
             return full_tail / target_tail
 
-        def warp_relative_positions(pos, full_center, local_center, max_pos,
+        def warp_relative_positions(pos, full_center, target_center, max_pos,
                                     train_max_pos):
             delta = pos.float() - float(full_center)
-            target_center = min(max(float(local_center), 0.0),
-                                float(train_max_pos))
-            t_neg, t_pos = directional_thresholds(full_center, max_pos,
-                                                  target_center,
-                                                  train_max_pos)
+            t_neg, t_pos = directional_thresholds(full_center, max_pos)
             full_neg_room = max(float(full_center), 0.0)
             full_pos_room = max(float(max_pos) - float(full_center), 0.0)
             target_neg_room = max(target_center, 0.0)
@@ -401,8 +348,8 @@ class WanSelfAttention(nn.Module):
                                warped).long().clamp(0, train_max_pos)
 
         def global_rope_indices(frame_idx, y_idx, x_idx, full_center_y,
-                                full_center_x, local_center_y,
-                                local_center_x):
+                                full_center_x, target_center_y,
+                                target_center_x):
             if not adaptive_rectified_rope:
                 return (
                     frame_idx.clamp(0, freqs.shape[0] - 1),
@@ -412,24 +359,40 @@ class WanSelfAttention(nn.Module):
                 )
             return (
                 frame_idx,
-                warp_relative_positions(y_idx, full_center_y, local_center_y,
+                warp_relative_positions(y_idx, full_center_y, target_center_y,
                                         h - 1, train_720_h - 1),
-                warp_relative_positions(x_idx, full_center_x, local_center_x,
+                warp_relative_positions(x_idx, full_center_x, target_center_x,
                                         w - 1, train_720_w - 1),
                 freqs,
             )
 
+        tile_world_size = (
+            dist.get_world_size()
+            if dist.is_available() and dist.is_initialized() else 1)
+        tile_rank = (
+            dist.get_rank()
+            if dist.is_available() and dist.is_initialized() else 0)
+
         for batch_idx, (f, h, w) in enumerate(grid_sizes.tolist()):
             seq_len = int(seq_lens[batch_idx].item())
-            q_grid = q[batch_idx, :seq_len].view(f, h, w, self.num_heads,
-                                                 self.head_dim)
-            k_grid = k[batch_idx, :seq_len].view(f, h, w, self.num_heads,
-                                                 self.head_dim)
-            v_grid = v[batch_idx, :seq_len].view(f, h, w, self.num_heads,
-                                                 self.head_dim)
-            canvas = torch.zeros_like(v_grid)
+            if project_from_hidden:
+                hidden_grid = hidden_states[batch_idx, :seq_len].view(
+                    f, h, w, self.dim)
+                q_grid = None
+                k_grid = None
+                v_grid = None
+            else:
+                hidden_grid = None
+                q_grid = q[batch_idx, :seq_len].view(
+                    f, h, w, self.num_heads, self.head_dim)
+                k_grid = k[batch_idx, :seq_len].view(
+                    f, h, w, self.num_heads, self.head_dim)
+                v_grid = v[batch_idx, :seq_len].view(
+                    f, h, w, self.num_heads, self.head_dim)
+            canvas = out[batch_idx, :seq_len].view(
+                f, h, w, self.num_heads, self.head_dim)
             weights = torch.zeros(
-                f, h, w, 1, 1, device=v.device, dtype=torch.float32)
+                f, h, w, 1, 1, device=attn_device, dtype=torch.float32)
             global_k = None
             global_v = None
             global_y = None
@@ -442,37 +405,33 @@ class WanSelfAttention(nn.Module):
             all_frame_idx = None
             all_y_idx = None
             all_x_idx = None
-            if full_global_attention:
-                all_k_flat = k_grid.reshape(seq_len, self.num_heads,
-                                            self.head_dim)
-                all_v_flat = v_grid.reshape(1, seq_len, self.num_heads,
-                                            self.head_dim)
-                all_frame_idx = torch.arange(
-                    f, device=v.device, dtype=torch.long).view(
-                        f, 1, 1).expand(f, h, w).reshape(-1)
-                all_y_idx = torch.arange(
-                    h, device=v.device, dtype=torch.long).view(
-                        1, h, 1).expand(f, h, w).reshape(-1)
-                all_x_idx = torch.arange(
-                    w, device=v.device, dtype=torch.long).view(
-                        1, 1, w).expand(f, h, w).reshape(-1)
             if global_stride > 0:
-                k_sparse = k_grid[:, ::global_stride, ::global_stride]
-                v_sparse = v_grid[:, ::global_stride, ::global_stride]
+                if project_from_hidden:
+                    hidden_sparse = hidden_grid[:, ::global_stride,
+                                                ::global_stride]
+                    sparse_shape = hidden_sparse.shape[:3]
+                    hidden_sparse = hidden_sparse.reshape(-1, self.dim)
+                    k_sparse = self.norm_k(self.k(hidden_sparse)).view(
+                        *sparse_shape, self.num_heads, self.head_dim)
+                    v_sparse = self.v(hidden_sparse).view(
+                        *sparse_shape, self.num_heads, self.head_dim)
+                else:
+                    k_sparse = k_grid[:, ::global_stride, ::global_stride]
+                    v_sparse = v_grid[:, ::global_stride, ::global_stride]
                 sparse_len = f * k_sparse.shape[1] * k_sparse.shape[2]
                 global_k = k_sparse.reshape(1, sparse_len, self.num_heads,
                                             self.head_dim)
                 global_v = v_sparse.reshape(1, sparse_len, self.num_heads,
                                             self.head_dim)
                 ys = torch.arange(
-                    0, h, global_stride, device=v.device, dtype=torch.long)
+                    0, h, global_stride, device=attn_device, dtype=torch.long)
                 xs = torch.arange(
-                    0, w, global_stride, device=v.device, dtype=torch.long)
+                    0, w, global_stride, device=attn_device, dtype=torch.long)
                 yy, xx = torch.meshgrid(ys, xs, indexing="ij")
                 global_y = yy.reshape(1, -1).expand(f, -1).reshape(-1)
                 global_x = xx.reshape(1, -1).expand(f, -1).reshape(-1)
                 global_frame = torch.arange(
-                    f, device=v.device, dtype=torch.long).view(f, 1).expand(
+                    f, device=attn_device, dtype=torch.long).view(f, 1).expand(
                         f, yy.numel()).reshape(-1)
             if routed_topk > 0:
                 route_keys = []
@@ -482,8 +441,19 @@ class WanSelfAttention(nn.Module):
                         gy1 = min(gy0 + routed_grid, h)
                         for gx0 in range(0, w, routed_grid):
                             gx1 = min(gx0 + routed_grid, w)
-                            k_cell = k_grid[frame, gy0:gy1, gx0:gx1].mean(
-                                dim=(0, 1)).unsqueeze(0)
+                            if project_from_hidden:
+                                cell_hidden = hidden_grid[
+                                    frame, gy0:gy1, gx0:gx1].reshape(
+                                        -1, self.dim)
+                                k_cell = self.norm_k(
+                                    self.k(cell_hidden)).view(
+                                        -1, self.num_heads,
+                                        self.head_dim).mean(
+                                            dim=0, keepdim=True)
+                            else:
+                                k_cell = k_grid[
+                                    frame, gy0:gy1, gx0:gx1].mean(
+                                        dim=(0, 1)).unsqueeze(0)
                             route_keys.append(k_cell.squeeze(0))
                             route_bounds_list.append(
                                 (frame, gy0, gy1, gx0, gx1))
@@ -491,58 +461,102 @@ class WanSelfAttention(nn.Module):
                 route_bounds = torch.tensor(
                     route_bounds_list,
                     dtype=torch.long,
-                    device=v.device)
+                    device=attn_device)
 
-            for y0 in starts(h, tile_h, stride_h):
-                for x0 in starts(w, tile_w, stride_w):
+            tile_coords = [
+                (y0, x0)
+                for y0 in starts(h, tile_h, stride_h)
+                for x0 in starts(w, tile_w, stride_w)
+            ]
+            if tile_coords:
+                for tile_index, (y0, x0) in enumerate(tile_coords):
+                    if tile_index % tile_world_size != tile_rank:
+                        continue
                     y1 = min(y0 + tile_h, h)
                     x1 = min(x0 + tile_w, w)
-                    cy0 = max(0, y0 - halo)
-                    cy1 = min(h, y1 + halo)
-                    cx0 = max(0, x0 - halo)
-                    cx1 = min(w, x1 + halo)
+                    cy0 = max(0, y0)
+                    cy1 = min(h, y1)
+                    cx0 = max(0, x0)
+                    cx1 = min(w, x1)
                     iy0, iy1 = y0 - cy0, y1 - cy0
                     ix0, ix1 = x0 - cx0, x1 - cx0
                     full_center_y = (y0 + y1 - 1) / 2.0
                     full_center_x = (x0 + x1 - 1) / 2.0
                     local_center_y = (iy0 + iy1 - 1) / 2.0
                     local_center_x = (ix0 + ix1 - 1) / 2.0
+                    local_pos_room_y = (iy1 - iy0 - 1) - local_center_y
+                    local_pos_room_x = (ix1 - ix0 - 1) - local_center_x
+                    target_center_y = proportional_target_center(
+                        full_center_y, local_center_y, local_pos_room_y,
+                        h - 1, train_720_h - 1)
+                    target_center_x = proportional_target_center(
+                        full_center_x, local_center_x, local_pos_room_x,
+                        w - 1, train_720_w - 1)
 
-                    q_crop = q_grid[:, cy0:cy1, cx0:cx1]
-                    k_crop = k_grid[:, cy0:cy1, cx0:cx1]
-                    v_crop = v_grid[:, cy0:cy1, cx0:cx1]
                     crop_grid = torch.tensor(
                         [[f, cy1 - cy0, cx1 - cx0]],
                         dtype=torch.long,
                         device=grid_sizes.device)
                     crop_len = f * (cy1 - cy0) * (cx1 - cx0)
-                    q_flat = q_crop.reshape(1, crop_len, self.num_heads,
-                                            self.head_dim)
-                    k_flat = k_crop.reshape(1, crop_len, self.num_heads,
-                                            self.head_dim)
-                    v_flat = v_crop.reshape(1, crop_len, self.num_heads,
-                                            self.head_dim)
-                    q_flat = rope_apply(q_flat, crop_grid, freqs)
-                    k_flat = rope_apply(k_flat, crop_grid, freqs)
+                    if project_from_hidden:
+                        hidden_crop = hidden_grid[:, cy0:cy1,
+                                                  cx0:cx1].reshape(
+                                                      1, crop_len, self.dim)
+                        q_flat = self.norm_q(self.q(hidden_crop)).view(
+                            1, crop_len, self.num_heads, self.head_dim)
+                        k_flat = self.norm_k(self.k(hidden_crop)).view(
+                            1, crop_len, self.num_heads, self.head_dim)
+                        v_flat = self.v(hidden_crop).view(
+                            1, crop_len, self.num_heads, self.head_dim)
+                        q_crop_grid = q_flat.view(
+                            f, cy1 - cy0, cx1 - cx0, self.num_heads,
+                            self.head_dim)
+                    else:
+                        q_crop = q_grid[:, cy0:cy1, cx0:cx1]
+                        k_crop = k_grid[:, cy0:cy1, cx0:cx1]
+                        v_crop = v_grid[:, cy0:cy1, cx0:cx1]
+                        q_flat = q_crop.reshape(
+                            1, crop_len, self.num_heads, self.head_dim)
+                        k_flat = k_crop.reshape(
+                            1, crop_len, self.num_heads, self.head_dim)
+                        v_flat = v_crop.reshape(
+                            1, crop_len, self.num_heads, self.head_dim)
+                        q_crop_grid = q_crop
+                    if adaptive_rectified_rope:
+                        local_frame = torch.arange(
+                            f, device=attn_device, dtype=torch.long).view(
+                                f, 1, 1).expand(
+                                    f, cy1 - cy0, cx1 - cx0).reshape(-1)
+                        local_y = torch.round(
+                            target_center_y + torch.arange(
+                                cy0,
+                                cy1,
+                                device=attn_device,
+                                dtype=torch.float32) - full_center_y).long()
+                        local_x = torch.round(
+                            target_center_x + torch.arange(
+                                cx0,
+                                cx1,
+                                device=attn_device,
+                                dtype=torch.float32) - full_center_x).long()
+                        local_y = local_y.view(
+                            1, cy1 - cy0, 1).expand(
+                                f, cy1 - cy0, cx1 - cx0).reshape(-1)
+                        local_x = local_x.view(
+                            1, 1, cx1 - cx0).expand(
+                                f, cy1 - cy0, cx1 - cx0).reshape(-1)
+                        q_flat = rope_apply_absolute(
+                            q_flat.squeeze(0), local_frame, local_y, local_x,
+                            freqs).unsqueeze(0)
+                        k_flat = rope_apply_absolute(
+                            k_flat.squeeze(0), local_frame, local_y, local_x,
+                            freqs).unsqueeze(0)
+                    else:
+                        q_flat = rope_apply(q_flat, crop_grid, freqs)
+                        k_flat = rope_apply(k_flat, crop_grid, freqs)
                     global_k_flat = None
                     global_v_flat = None
-                    if full_global_attention:
-                        g_frame, g_y, g_x, g_freqs = global_rope_indices(
-                            all_frame_idx, all_y_idx, all_x_idx,
-                            full_center_y, full_center_x,
-                            local_center_y, local_center_x)
-                        global_k_flat = rope_apply_absolute(
-                            all_k_flat, g_frame, g_y, g_x,
-                            g_freqs).reshape(
-                                1, seq_len, self.num_heads, self.head_dim)
-                        y_crop = flash_attention(
-                            q=q_flat,
-                            k=global_k_flat,
-                            v=all_v_flat,
-                            softmax_scale=scale).view(
-                                f, cy1 - cy0, cx1 - cx0, self.num_heads,
-                                self.head_dim)
-                    elif route_k is not None:
+                    if route_k is not None:
                         selected_k = []
                         selected_v = []
                         selected_route_indices = []
@@ -565,11 +579,11 @@ class WanSelfAttention(nn.Module):
                                 query_x_centers.append((qx0 + qx1 - 1) // 2)
                         query_y_centers = torch.tensor(
                             query_y_centers,
-                            device=v.device,
+                            device=attn_device,
                             dtype=torch.long)
                         query_x_centers = torch.tensor(
                             query_x_centers,
-                            device=v.device,
+                            device=attn_device,
                             dtype=torch.long)
                         frame_bounds = route_bounds_by_frame
                         frame_route_k = route_k_by_frame
@@ -583,8 +597,8 @@ class WanSelfAttention(nn.Module):
                         route_frame, route_y, route_x, route_freqs = (
                             global_rope_indices(route_frame, route_y, route_x,
                                                 full_center_y, full_center_x,
-                                                local_center_y,
-                                                local_center_x))
+                                                target_center_y,
+                                                target_center_x))
                         k_route = rope_apply_absolute(
                             frame_route_k.reshape(f * cells_per_frame,
                                                   self.num_heads,
@@ -608,8 +622,10 @@ class WanSelfAttention(nn.Module):
                             frame_end = min(f, frame_start + route_frame_batch)
                             frames_in_chunk = frame_end - frame_start
                             route_queries = [
-                                q_grid[frame_start:frame_end, qy0:qy1,
-                                       qx0:qx1].mean(dim=(1, 2))
+                                q_crop_grid[
+                                    frame_start:frame_end,
+                                    qy0 - cy0:qy1 - cy0,
+                                    qx0 - cx0:qx1 - cx0].mean(dim=(1, 2))
                                 for qy0, qy1, qx0, qx1 in query_cells
                             ]
                             route_q = torch.stack(route_queries, dim=1)
@@ -620,7 +636,7 @@ class WanSelfAttention(nn.Module):
                             route_frame_idx = torch.arange(
                                 frame_start,
                                 frame_end,
-                                device=v.device,
+                                device=attn_device,
                                 dtype=torch.long).view(
                                     frames_in_chunk, 1).expand(
                                         frames_in_chunk,
@@ -635,7 +651,7 @@ class WanSelfAttention(nn.Module):
                                 global_rope_indices(
                                     route_frame_idx, route_y_idx, route_x_idx,
                                     full_center_y, full_center_x,
-                                    local_center_y, local_center_x))
+                                    target_center_y, target_center_x))
                             q_route = rope_apply_absolute(
                                 route_q, route_frame_idx, route_y_idx,
                                 route_x_idx, route_freqs).mean(dim=1).float()
@@ -672,22 +688,37 @@ class WanSelfAttention(nn.Module):
                         for route_index in selected_route_indices:
                             frame, gy0, gy1, gx0, gx1 = (
                                 route_bounds[route_index].tolist())
-                            k_cell = k_grid[frame:frame + 1, gy0:gy1, gx0:gx1]
-                            k_cell = k_cell.reshape(
-                                (gy1 - gy0) * (gx1 - gx0),
-                                self.num_heads, self.head_dim)
+                            if project_from_hidden:
+                                cell_hidden = hidden_grid[
+                                    frame, gy0:gy1, gx0:gx1].reshape(
+                                        -1, self.dim)
+                                k_cell = self.norm_k(
+                                    self.k(cell_hidden)).view(
+                                        -1, self.num_heads, self.head_dim)
+                                v_cell = self.v(cell_hidden).view(
+                                    -1, self.num_heads, self.head_dim)
+                            else:
+                                k_cell = k_grid[
+                                    frame:frame + 1, gy0:gy1,
+                                    gx0:gx1].reshape(
+                                        (gy1 - gy0) * (gx1 - gx0),
+                                        self.num_heads, self.head_dim)
+                                v_cell = v_grid[
+                                    frame:frame + 1, gy0:gy1,
+                                    gx0:gx1].reshape(
+                                        -1, self.num_heads, self.head_dim)
                             cell_frame_idx = torch.full(
                                 (k_cell.size(0),),
                                 frame,
-                                device=v.device,
+                                device=attn_device,
                                 dtype=torch.long)
                             cell_y_idx = torch.arange(
-                                gy0, gy1, device=v.device,
+                                gy0, gy1, device=attn_device,
                                 dtype=torch.long).view(
                                     gy1 - gy0, 1).expand(
                                         gy1 - gy0, gx1 - gx0).reshape(-1)
                             cell_x_idx = torch.arange(
-                                gx0, gx1, device=v.device,
+                                gx0, gx1, device=attn_device,
                                 dtype=torch.long).view(
                                     1, gx1 - gx0).expand(
                                         gy1 - gy0, gx1 - gx0).reshape(-1)
@@ -695,16 +726,12 @@ class WanSelfAttention(nn.Module):
                                 global_rope_indices(
                                     cell_frame_idx, cell_y_idx, cell_x_idx,
                                     full_center_y, full_center_x,
-                                    local_center_y, local_center_x))
+                                    target_center_y, target_center_x))
                             selected_k.append(
                                 rope_apply_absolute(
                                     k_cell, cell_frame_idx, cell_y_idx,
                                     cell_x_idx, cell_freqs))
-                            selected_v.append(
-                                v_grid[frame:frame + 1, gy0:gy1,
-                                       gx0:gx1].reshape(
-                                           -1, self.num_heads,
-                                           self.head_dim))
+                            selected_v.append(v_cell)
                         if selected_k:
                             selected_k = torch.cat(selected_k, dim=0)
                             selected_v = torch.cat(selected_v, dim=0)
@@ -725,7 +752,7 @@ class WanSelfAttention(nn.Module):
                         g_x = global_x[global_mask]
                         g_frame, g_y, g_x, g_freqs = global_rope_indices(
                             g_frame, g_y, g_x, full_center_y, full_center_x,
-                            local_center_y, local_center_x)
+                            target_center_y, target_center_x)
                         global_k_flat = rope_apply_absolute(
                             global_k_flat.reshape(
                                 global_k_flat.shape[1], self.num_heads,
@@ -733,8 +760,7 @@ class WanSelfAttention(nn.Module):
                             g_freqs).reshape(
                                 1, global_k_flat.shape[1], self.num_heads,
                                 self.head_dim)
-                    if (not full_global_attention and
-                            global_k_flat is not None and
+                    if (global_k_flat is not None and
                             global_v_flat is not None):
                         k_all = torch.cat([k_flat, global_k_flat], dim=1)
                         v_all = torch.cat([v_flat, global_v_flat], dim=1)
@@ -745,7 +771,7 @@ class WanSelfAttention(nn.Module):
                             softmax_scale=scale).view(
                                 f, cy1 - cy0, cx1 - cx0, self.num_heads,
                                 self.head_dim)
-                    elif not full_global_attention:
+                    else:
                         y_crop = flash_attention(
                             q=q_flat,
                             k=k_flat,
@@ -753,16 +779,19 @@ class WanSelfAttention(nn.Module):
                             softmax_scale=scale).view(
                                 f, cy1 - cy0, cx1 - cx0, self.num_heads,
                                 self.head_dim)
+
                     y_inner = y_crop[:, iy0:iy1, ix0:ix1]
-                    blend = blend_window(y1 - y0, x1 - x0, v.device,
+                    blend = blend_window(y1 - y0, x1 - x0, attn_device,
                                          torch.float32)
                     canvas[:, y0:y1, x0:x1] += (
                         y_inner.float() * blend).to(canvas.dtype)
                     weights[:, y0:y1, x0:x1] += blend
 
-            out[batch_idx, :seq_len] = (
-                canvas / weights.clamp_min(1e-8).to(canvas.dtype)).reshape(
-                    seq_len, self.num_heads, self.head_dim)
+            if tile_world_size > 1:
+                dist.all_reduce(canvas, op=dist.ReduceOp.SUM)
+                dist.all_reduce(weights, op=dist.ReduceOp.SUM)
+
+            canvas.div_(weights.clamp_min(1e-8).to(canvas.dtype))
 
         return out
 

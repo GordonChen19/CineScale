@@ -290,6 +290,8 @@ def move_scheduler_to_device(scheduler, device):
 
 def set_block_tiled_self_attention(model, enabled, tile_height, tile_width,
                                    stride_height, stride_width,
+                                   halo,
+                                   full_global,
                                    routed_topk, routed_grid,
                                    global_rope_threshold,
                                    adaptive_rectified_rope):
@@ -297,6 +299,8 @@ def set_block_tiled_self_attention(model, enabled, tile_height, tile_width,
         raise ValueError(
             "Block tiled self-attention tile and stride dimensions must be positive."
         )
+    if enabled and halo < 0:
+        raise ValueError("--block_tiled_self_attn_halo must be non-negative.")
     if enabled and routed_topk < 0:
         raise ValueError(
             "--block_tiled_self_attn_routed_topk must be non-negative.")
@@ -315,8 +319,11 @@ def set_block_tiled_self_attention(model, enabled, tile_height, tile_width,
             block.self_attn.block_tiled_attn_tile_w = tile_width
             block.self_attn.block_tiled_attn_stride_h = stride_height
             block.self_attn.block_tiled_attn_stride_w = stride_width
+            block.self_attn.block_tiled_attn_halo = halo
+            block.self_attn.block_tiled_attn_full_global = (
+                full_global if enabled else False)
             block.self_attn.block_tiled_attn_routed_topk = (
-                routed_topk if enabled else 0)
+                routed_topk if enabled and not full_global else 0)
             block.self_attn.block_tiled_attn_routed_grid = routed_grid
             block.self_attn.block_tiled_attn_global_rope_threshold = (
                 global_rope_threshold)
@@ -762,6 +769,8 @@ def run(args, model, cfg):
             args.block_tiled_self_attn_tile_width,
             args.block_tiled_self_attn_stride_height,
             args.block_tiled_self_attn_stride_width,
+            args.block_tiled_self_attn_halo,
+            args.block_tiled_self_attn_full_global,
             args.block_tiled_self_attn_routed_topk,
             args.block_tiled_self_attn_routed_grid,
             args.block_tiled_self_attn_global_rope_threshold,
@@ -785,6 +794,8 @@ def run(args, model, cfg):
             args.block_tiled_self_attn_tile_width,
             args.block_tiled_self_attn_stride_height,
             args.block_tiled_self_attn_stride_width,
+            args.block_tiled_self_attn_halo,
+            args.block_tiled_self_attn_full_global,
             args.block_tiled_self_attn_routed_topk,
             args.block_tiled_self_attn_routed_grid,
             args.block_tiled_self_attn_global_rope_threshold,
@@ -829,8 +840,7 @@ def run(args, model, cfg):
         del base_latent
         metadata["input_mode"] = "prompt"
     else:
-        source_latent, source_metadata = load_input_latent(
-            args.video, args.decode_latent_key)
+        source_latent, source_metadata = load_input_latent(args.video)
         clean_latent, resize_metadata = resize_latent_input_to_size(
             model, source_latent, encode_size)
         seq_len = compute_seq_len(model, clean_latent.shape)
@@ -842,7 +852,7 @@ def run(args, model, cfg):
             "input_mode": "latent",
             "input_latent": args.video,
             "input_latent_key": source_metadata.get("decoded_latent_key",
-                                                    args.decode_latent_key),
+                                                    "prompt_base_latent"),
             "input_latent_shape": tuple(source_latent.shape),
             "input_latent_size": source_size,
             "input_resize_mode": "latent",
@@ -966,7 +976,7 @@ def parse_args():
     parser.add_argument(
         "--block_tiled_self_attn",
         type=str2bool,
-        default=False,
+        default=True,
         help="Tile only DiT self-attention inside each block, stitch the self-attention output, then run global cross-attention/FFN.")
     parser.add_argument(
         "--adaptive_rectified_ntk_rope",
@@ -993,6 +1003,16 @@ def parse_args():
         type=int,
         default=15,
         help="Self-attention tile stride width in transformer patch-token units.")
+    parser.add_argument(
+        "--block_tiled_self_attn_halo",
+        type=int,
+        default=0,
+        help="Additional neighboring context around each self-attention tile core, in transformer patch-token units. Halo outputs are discarded before stitching.")
+    parser.add_argument(
+        "--block_tiled_self_attn_full_global",
+        type=str2bool,
+        default=False,
+        help="Use tiled queries against every full-video K/V token in one FlashAttention softmax. Global K coordinates are rectified relative to each query tile; top-k routing is bypassed.")
     parser.add_argument(
         "--block_tiled_self_attn_routed_topk",
         type=int,
@@ -1107,27 +1127,27 @@ if __name__ == "__main__":
 # python CineScale/Wan2.2/cinescale.py \
 #   --decode_latent CineScale/4k_result.pt \
 #   --ckpt_dir Wan2.2-T2V-A14B \
-#   --save_video CineScale/base_result.mp4  
+#   --save_video CineScale/result.mp4  
 
 # CUDA_VISIBLE_DEVICES=0,1,2,3 \
 # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 # torchrun --standalone --nproc_per_node=4 CineScale/Wan2.2/cinescale.py \
-#   --video CineScale/4k_result.pt \
+# --video CineScale/4k_result.pt \
 #   --decode_latent_key prompt_base_latent \
 #   --size "3840*2160" \
 #   --prompt "Dusk time, soft lighting, side lighting, low contrast lighting, medium long shot, balanced composition, warm colors, two shot, daylight.A graceful Mongolian woman is performing the **bowl dance** on a vast grassland. She is wearing a bright red Mongolian robe embroidered with cloud and floral patterns, a wide silk sash at her waist, and a traditional hat with an exquisite headdress, her expression focused. As the camera moves to the left, she balances six porcelain bowls stacked on her head. Her steps are steady, and her arms sway like waves as she performs soft arm and shoulder shake movements. Simultaneously, she executes backbends, spins, and small jumps with movements that are both elegant and powerful. The background is a vast grassland with several yurts, and golden sunlight falls on the scene, creating a warm and magnificent atmosphere." \
 #   --ckpt_dir Wan2.2-T2V-A14B \
 #   --frame_num 41 \
-#   --round_noise_steps 25 \
+#   --round_noise_steps 20 \
 #   --sample_shift 12 \
-#   --block_tiled_self_attn true \
 #   --block_tiled_self_attn_tile_height 30 \
 #   --block_tiled_self_attn_tile_width 30 \
 #   --block_tiled_self_attn_stride_height 30 \
 #   --block_tiled_self_attn_stride_width 30 \
+# --block_tiled_self_attn_halo 10 \
 #  --block_tiled_self_attn_routed_topk 8 \
 #   --block_tiled_self_attn_routed_grid 15 \
-# --block_tiled_self_attn_global_rope_threshold 20 \
+# --block_tiled_self_attn_global_rope_threshold 10 \
 #   --save_latent CineScale/4k_result.pt \
 #   --ulysses_size 4 \
 #   --dit_fsdp \

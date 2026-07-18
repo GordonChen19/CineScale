@@ -181,9 +181,6 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
         # full-resolution attention tensors on every rank.
         x_full = gather_forward(x, dim=1)
         x_full = self.block_tiled_self_attention(
-            None,
-            None,
-            None,
             seq_lens,
             grid_sizes,
             freqs,

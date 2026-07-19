@@ -176,17 +176,17 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
         return q, k, v
 
     if getattr(self, "block_tiled_attn_enabled", False):
-        # Tiled attention needs the full spatial grid. Gather the hidden
-        # sequence, but project Q/K/V only for owned tiles to avoid replicating
-        # full-resolution attention tensors on every rank.
-        x_full = gather_forward(x, dim=1)
-        x_full = self.block_tiled_self_attention(
-            seq_lens,
-            grid_sizes,
-            freqs,
-            hidden_states=x_full)
-        rank = get_rank()
-        x = x_full[:, rank * s:(rank + 1) * s].contiguous()
+        # Process every tile collectively. K/V remain sequence-sharded and
+        # Ulysses performs the global softmax without gathering full-resolution
+        # hidden, K, V, or output tensors on every rank.
+        x = self.block_tiled_self_attention(
+            seq_lens=seq_lens,
+            grid_sizes=grid_sizes,
+            freqs=freqs,
+            hidden_states=x,
+            distributed_attention_fn=distributed_attention,
+            sequence_rank=get_rank(),
+            sequence_world_size=get_world_size())
     else:
         q, k, v = qkv_fn(x)
         q = rope_apply(q, grid_sizes, freqs)

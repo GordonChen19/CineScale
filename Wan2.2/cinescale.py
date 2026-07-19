@@ -289,15 +289,11 @@ def move_scheduler_to_device(scheduler, device):
 
 
 def set_block_tiled_self_attention(model, enabled, tile_height, tile_width,
-                                   stride_height, stride_width,
-                                   halo,
                                    global_rope_threshold):
-    if enabled and min(tile_height, tile_width, stride_height, stride_width) <= 0:
+    if enabled and min(tile_height, tile_width) <= 0:
         raise ValueError(
-            "Block tiled self-attention tile and stride dimensions must be positive."
+            "Block tiled self-attention tile must be positive."
         )
-    if enabled and halo < 0:
-        raise ValueError("--block_tiled_self_attn_halo must be non-negative.")
     if enabled and global_rope_threshold < 0:
         raise ValueError(
             "--block_tiled_self_attn_global_rope_threshold must be non-negative."
@@ -308,9 +304,6 @@ def set_block_tiled_self_attention(model, enabled, tile_height, tile_width,
             block.self_attn.block_tiled_attn_enabled = enabled
             block.self_attn.block_tiled_attn_tile_h = tile_height
             block.self_attn.block_tiled_attn_tile_w = tile_width
-            block.self_attn.block_tiled_attn_stride_h = stride_height
-            block.self_attn.block_tiled_attn_stride_w = stride_width
-            block.self_attn.block_tiled_attn_halo = halo
             block.self_attn.block_tiled_attn_global_rope_threshold = (
                 global_rope_threshold)
 
@@ -751,9 +744,6 @@ def run(args, model, cfg):
             enabled,
             args.block_tiled_self_attn_tile_height,
             args.block_tiled_self_attn_tile_width,
-            args.block_tiled_self_attn_stride_height,
-            args.block_tiled_self_attn_stride_width,
-            args.block_tiled_self_attn_halo,
             args.block_tiled_self_attn_global_rope_threshold)
 
     prompt_base_latent_cpu = None
@@ -772,9 +762,6 @@ def run(args, model, cfg):
             configure_block_tiled_attention_for_base,
             args.block_tiled_self_attn_tile_height,
             args.block_tiled_self_attn_tile_width,
-            args.block_tiled_self_attn_stride_height,
-            args.block_tiled_self_attn_stride_width,
-            args.block_tiled_self_attn_halo,
             args.block_tiled_self_attn_global_rope_threshold)
         base_latent, _ = denoise_trajectory(
             model=model,
@@ -955,31 +942,10 @@ def parse_args():
         default=True,
         help="Tile only DiT self-attention inside each block, stitch the self-attention output, then run global cross-attention/FFN.")
     parser.add_argument(
-        "--block_tiled_self_attn_tile_height",
-        type=int,
-        default=20,
-        help="Inner self-attention tile height in transformer patch-token units.")
-    parser.add_argument(
         "--block_tiled_self_attn_tile_width",
         type=int,
         default=20,
         help="Inner self-attention tile width in transformer patch-token units.")
-    parser.add_argument(
-        "--block_tiled_self_attn_stride_height",
-        type=int,
-        default=15,
-        help="Self-attention tile stride height in transformer patch-token units.")
-    parser.add_argument(
-        "--block_tiled_self_attn_stride_width",
-        type=int,
-        default=15,
-        help="Self-attention tile stride width in transformer patch-token units.")
-    parser.add_argument(
-        "--block_tiled_self_attn_halo",
-        type=int,
-        default=0,
-        help="Additional neighboring context around each self-attention tile core, in transformer patch-token units. Halo outputs are discarded before stitching.")
-
     parser.add_argument(
         "--block_tiled_self_attn_global_rope_threshold",
         type=float,
@@ -1089,19 +1055,16 @@ if __name__ == "__main__":
 # CUDA_VISIBLE_DEVICES=0,1,2,3 \
 # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 # torchrun --standalone --nproc_per_node=4 CineScale/Wan2.2/cinescale.py \
-# --video CineScale/4k_result.pt \
+#   --video CineScale/4k_result.pt \
 #   --size "3840*2160" \
 #   --prompt "Dusk time, soft lighting, side lighting, low contrast lighting, medium long shot, balanced composition, warm colors, two shot, daylight.A graceful Mongolian woman is performing the **bowl dance** on a vast grassland. She is wearing a bright red Mongolian robe embroidered with cloud and floral patterns, a wide silk sash at her waist, and a traditional hat with an exquisite headdress, her expression focused. As the camera moves to the left, she balances six porcelain bowls stacked on her head. Her steps are steady, and her arms sway like waves as she performs soft arm and shoulder shake movements. Simultaneously, she executes backbends, spins, and small jumps with movements that are both elegant and powerful. The background is a vast grassland with several yurts, and golden sunlight falls on the scene, creating a warm and magnificent atmosphere." \
 #   --ckpt_dir Wan2.2-T2V-A14B \
 #   --frame_num 41 \
 #   --round_noise_steps 20 \
 #   --sample_shift 12 \
-#   --block_tiled_self_attn_tile_height 30 \
 #   --block_tiled_self_attn_tile_width 30 \
-#   --block_tiled_self_attn_stride_height 30 \
-#   --block_tiled_self_attn_stride_width 30 \
-# --block_tiled_self_attn_halo 5 \
-# --block_tiled_self_attn_global_rope_threshold 10 \
+#   --block_tiled_self_attn_stride_height 20 \
+#   --block_tiled_self_attn_global_rope_threshold 10 \
 #   --save_latent CineScale/4k_result.pt \
 #   --ulysses_size 4 \
 #   --dit_fsdp \

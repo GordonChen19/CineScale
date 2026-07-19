@@ -118,9 +118,6 @@ class WanSelfAttention(nn.Module):
         self.block_tiled_attn_enabled = False
         self.block_tiled_attn_tile_h = 0
         self.block_tiled_attn_tile_w = 0
-        self.block_tiled_attn_stride_h = 0
-        self.block_tiled_attn_stride_w = 0
-        self.block_tiled_attn_halo = 0
         self.block_tiled_attn_global_rope_threshold = 24.0
 
         # layers
@@ -189,40 +186,22 @@ class WanSelfAttention(nn.Module):
         scale = 1.0 / math.sqrt(self.head_dim)
         tile_h = self.block_tiled_attn_tile_h
         tile_w = self.block_tiled_attn_tile_w
-        stride_h = self.block_tiled_attn_stride_h
-        stride_w = self.block_tiled_attn_stride_w
-        halo = self.block_tiled_attn_halo
         rope_threshold = self.block_tiled_attn_global_rope_threshold
         max_relative_y = 44
         max_relative_x = 79
-        if min(tile_h, tile_w, stride_h, stride_w) <= 0:
-            raise ValueError("Block tiled self-attention tile/stride values must be positive.")
-        if halo < 0:
+        if min(tile_h, tile_w) <= 0:
             raise ValueError(
-                "Block tiled self-attention halo must be non-negative.")
+                "Block tiled self-attention tile values must be positive.")
         if rope_threshold < 0:
             raise ValueError(
                 "Block tiled self-attention global RoPE threshold must be non-negative."
             )
 
 
-        def starts(length, tile, stride):
-            if tile >= length:
-                return [0]
-            values = list(range(0, length - tile + 1, stride))
-            if values[-1] != length - tile:
-                values.append(length - tile)
-            return values
-
-        def blend_window(height, width, device, dtype):
-            wy = (torch.ones(height, device=device, dtype=dtype)
-                  if height <= 1 else torch.hann_window(
-                      height, periodic=False, device=device, dtype=dtype))
-            wx = (torch.ones(width, device=device, dtype=dtype)
-                  if width <= 1 else torch.hann_window(
-                      width, periodic=False, device=device, dtype=dtype))
-            return (wy[:, None] * wx[None, :]).clamp_min(1e-3).view(
-                height, width, 1, 1)
+        def starts(length, tile):
+            # Strict non-overlapping partition. The final tile is smaller when
+            # the axis length is not divisible by the configured tile size.
+            return list(range(0, length, tile))
 
         @torch.amp.autocast('cuda', enabled=False)
         def rope_apply_absolute(x, frame_idx, y_idx, x_idx, freqs):
@@ -348,8 +327,6 @@ class WanSelfAttention(nn.Module):
                 local_end = local_start + local_s
                 hidden_local = hidden_states[batch_idx]
                 canvas = out[batch_idx]
-                weights = torch.zeros(
-                    local_s, 1, 1, device=attn_device, dtype=torch.float32)
 
                 global_local_idx = (
                     local_start
@@ -379,16 +356,16 @@ class WanSelfAttention(nn.Module):
 
                 tile_coords = [
                     (y0, x0)
-                    for y0 in starts(h, tile_h, stride_h)
-                    for x0 in starts(w, tile_w, stride_w)
+                    for y0 in starts(h, tile_h)
+                    for x0 in starts(w, tile_w)
                 ]
                 for y0, x0 in tile_coords:
                     y1 = min(y0 + tile_h, h)
                     x1 = min(x0 + tile_w, w)
-                    cy0 = max(0, y0 - halo)
-                    cy1 = min(h, y1 + halo)
-                    cx0 = max(0, x0 - halo)
-                    cx1 = min(w, x1 + halo)
+                    cy0 = max(0, y0)
+                    cy1 = min(h, y1)
+                    cx0 = max(0, x0)
+                    cx1 = min(w, x1)
                     iy0, iy1 = y0 - cy0, y1 - cy0
                     ix0, ix1 = x0 - cx0, x1 - cx0
                     tile_y_min, tile_y_max = y0, y1 - 1
@@ -496,26 +473,12 @@ class WanSelfAttention(nn.Module):
                     if output_owned.any():
                         local_output_idx = (
                             core_global_idx[output_owned] - local_start)
-                        blend = blend_window(
-                            y1 - y0, x1 - x0, attn_device,
-                            torch.float32).expand(
-                                f, y1 - y0, x1 - x0, 1, 1).reshape(
-                                    -1, 1, 1)
-                        owned_blend = blend[output_owned]
                         owned_output = y_inner.reshape(
                             -1, self.num_heads,
                             self.head_dim)[output_owned]
-                        canvas.index_add_(
-                            0,
-                            local_output_idx,
-                            (owned_output.float() * owned_blend).to(
-                                canvas.dtype))
-                        weights.index_add_(
-                            0, local_output_idx, owned_blend)
+                        canvas[local_output_idx] = owned_output
                     del y_crop, y_inner
 
-                covered = weights[:, 0, 0] > 0
-                canvas[covered] /= weights[covered].to(canvas.dtype)
                 del k_local_raw, v_local
             return out
 
@@ -533,8 +496,6 @@ class WanSelfAttention(nn.Module):
                     f, h, w, self.dim)
             canvas = out[batch_idx, :seq_len].view(
                 f, h, w, self.num_heads, self.head_dim)
-            weights = torch.zeros(
-                f, h, w, 1, 1, device=attn_device, dtype=torch.float32)
             all_k_flat = None
             all_v_flat = None
             all_frame_idx = None
@@ -582,8 +543,8 @@ class WanSelfAttention(nn.Module):
 
             tile_coords = [
                 (y0, x0)
-                for y0 in starts(h, tile_h, stride_h)
-                for x0 in starts(w, tile_w, stride_w)
+                for y0 in starts(h, tile_h)
+                for x0 in starts(w, tile_w)
             ]
             if tile_coords:
                 for tile_index, (y0, x0) in enumerate(tile_coords):
@@ -591,15 +552,13 @@ class WanSelfAttention(nn.Module):
                         continue
                     y1 = min(y0 + tile_h, h)
                     x1 = min(x0 + tile_w, w)
-                    cy0 = max(0, y0 - halo)
-                    cy1 = min(h, y1 + halo)
-                    cx0 = max(0, x0 - halo)
-                    cx1 = min(w, x1 + halo)
+                    cy0 = max(0, y0)
+                    cy1 = min(h, y1)
+                    cx0 = max(0, x0)
+                    cx1 = min(w, x1)
                     iy0, iy1 = y0 - cy0, y1 - cy0
                     ix0, ix1 = x0 - cx0, x1 - cx0
                     # Rectified global RoPE is bounded against the output core.
-                    # Halo queries are discarded after attention and therefore
-                    # must not enlarge the core's positional budget.
                     tile_y_min, tile_y_max = y0, y1 - 1
                     tile_x_min, tile_x_max = x0, x1 - 1
 
@@ -645,17 +604,10 @@ class WanSelfAttention(nn.Module):
                     del global_k_flat
 
                     y_inner = y_crop[:, iy0:iy1, ix0:ix1]
-                    blend = blend_window(y1 - y0, x1 - x0, attn_device,
-                                         torch.float32)
-                    canvas[:, y0:y1, x0:x1] += (
-                        y_inner.float() * blend).to(canvas.dtype)
-                    weights[:, y0:y1, x0:x1] += blend
+                    canvas[:, y0:y1, x0:x1] = y_inner
 
             if tile_world_size > 1:
                 dist.all_reduce(canvas, op=dist.ReduceOp.SUM)
-                dist.all_reduce(weights, op=dist.ReduceOp.SUM)
-
-            canvas.div_(weights.clamp_min(1e-8).to(canvas.dtype))
 
         return out
 

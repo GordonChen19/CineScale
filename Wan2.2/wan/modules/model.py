@@ -119,6 +119,8 @@ class WanSelfAttention(nn.Module):
         self.block_tiled_attn_tile_h = 0
         self.block_tiled_attn_tile_w = 0
         self.block_tiled_attn_global_rope_threshold = 24.0
+        self.block_tiled_attn_global_rope_threshold_y = None
+        self.block_tiled_attn_global_rope_threshold_x = None
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -173,7 +175,8 @@ class WanSelfAttention(nn.Module):
                                    grid_sizes,
                                    freqs,
                                    hidden_states=None,
-                                   distributed_attention_fn=None,
+                                   distributed_kv_prepare_fn=None,
+                                   distributed_prepared_attention_fn=None,
                                    sequence_rank=0,
                                    sequence_world_size=1):
         project_from_hidden = hidden_states is not None
@@ -186,15 +189,21 @@ class WanSelfAttention(nn.Module):
         scale = 1.0 / math.sqrt(self.head_dim)
         tile_h = self.block_tiled_attn_tile_h
         tile_w = self.block_tiled_attn_tile_w
-        rope_threshold = self.block_tiled_attn_global_rope_threshold
+        rope_threshold_y = self.block_tiled_attn_global_rope_threshold_y
+        rope_threshold_x = self.block_tiled_attn_global_rope_threshold_x
+        if rope_threshold_y is None:
+            rope_threshold_y = self.block_tiled_attn_global_rope_threshold
+        if rope_threshold_x is None:
+            rope_threshold_x = self.block_tiled_attn_global_rope_threshold
         max_relative_y = 44
         max_relative_x = 79
         if min(tile_h, tile_w) <= 0:
             raise ValueError(
                 "Block tiled self-attention tile values must be positive.")
-        if rope_threshold < 0:
+        if min(rope_threshold_y, rope_threshold_x) < 0:
             raise ValueError(
-                "Block tiled self-attention global RoPE threshold must be non-negative."
+                "Block tiled self-attention global RoPE thresholds must be "
+                "non-negative."
             )
 
 
@@ -243,7 +252,7 @@ class WanSelfAttention(nn.Module):
 
 
         def warp_axis_positions(pos, tile_min, tile_max, max_pos,
-                                max_relative):
+                                max_relative, rope_threshold):
             """Compress only positions whose distance from a tile exceeds the
             training-relative range.
 
@@ -297,14 +306,16 @@ class WanSelfAttention(nn.Module):
             return (
                 frame_idx,
                 warp_axis_positions(y_idx, tile_y_min, tile_y_max, h - 1,
-                                    max_relative_y),
+                                    max_relative_y, rope_threshold_y),
                 warp_axis_positions(x_idx, tile_x_min, tile_x_max, w - 1,
-                                    max_relative_x),
+                                    max_relative_x, rope_threshold_x),
                 freqs,
             )
 
         distributed_mode = (
-            distributed_attention_fn is not None and sequence_world_size > 1)
+            distributed_kv_prepare_fn is not None
+            and distributed_prepared_attention_fn is not None
+            and sequence_world_size > 1)
         if distributed_mode:
             if not dist.is_available() or not dist.is_initialized():
                 raise RuntimeError(
@@ -327,32 +338,34 @@ class WanSelfAttention(nn.Module):
                 local_end = local_start + local_s
                 hidden_local = hidden_states[batch_idx]
                 canvas = out[batch_idx]
-
-                global_local_idx = (
-                    local_start
-                    + torch.arange(
-                        local_s, device=attn_device, dtype=torch.long))
-                valid_local = global_local_idx < seq_len
-                safe_global_idx = global_local_idx.clamp(
-                    min=0, max=max(seq_len - 1, 0))
                 frame_area = h * w
-                local_frame = torch.div(
-                    safe_global_idx, frame_area, rounding_mode="floor")
-                local_spatial = safe_global_idx.remainder(frame_area)
-                local_y = torch.div(
-                    local_spatial, w, rounding_mode="floor")
-                local_x = local_spatial.remainder(w)
-                local_frame = torch.where(
-                    valid_local, local_frame, torch.zeros_like(local_frame))
-                local_y = torch.where(
-                    valid_local, local_y, torch.zeros_like(local_y))
-                local_x = torch.where(
-                    valid_local, local_x, torch.zeros_like(local_x))
 
                 k_local_raw = self.norm_k(self.k(hidden_local)).view(
-                    local_s, self.num_heads, self.head_dim)
+                    1, local_s, self.num_heads, self.head_dim)
                 v_local = self.v(hidden_local).view(
                     1, local_s, self.num_heads, self.head_dim)
+                k_prepared_raw, v_prepared = distributed_kv_prepare_fn(
+                    k_local_raw, v_local)
+                del k_local_raw, v_local
+
+                prepared_s = k_prepared_raw.size(1)
+                key_global_idx = torch.arange(
+                    prepared_s, device=attn_device, dtype=torch.long)
+                valid_key = key_global_idx < seq_len
+                safe_key_idx = key_global_idx.clamp(
+                    min=0, max=max(seq_len - 1, 0))
+                key_frame = torch.div(
+                    safe_key_idx, frame_area, rounding_mode="floor")
+                key_spatial = safe_key_idx.remainder(frame_area)
+                key_y = torch.div(
+                    key_spatial, w, rounding_mode="floor")
+                key_x = key_spatial.remainder(w)
+                key_frame = torch.where(
+                    valid_key, key_frame, torch.zeros_like(key_frame))
+                key_y = torch.where(
+                    valid_key, key_y, torch.zeros_like(key_y))
+                key_x = torch.where(
+                    valid_key, key_x, torch.zeros_like(key_x))
 
                 tile_coords = [
                     (y0, x0)
@@ -428,16 +441,16 @@ class WanSelfAttention(nn.Module):
                         q_local, q_frame, q_y, q_x, freqs).unsqueeze(0)
 
                     _, warped_y, warped_x, warped_freqs = global_rope_indices(
-                        local_frame, local_y, local_x,
+                        key_frame, key_y, key_x,
                         tile_y_min, tile_y_max, tile_x_min, tile_x_max)
-                    k_local = rope_apply_absolute_chunked(
-                        k_local_raw, local_frame, warped_y, warped_x,
-                        warped_freqs).unsqueeze(0)
+                    k_prepared = rope_apply_absolute_chunked(
+                        k_prepared_raw.squeeze(0), key_frame, warped_y,
+                        warped_x, warped_freqs).unsqueeze(0)
 
-                    y_local = distributed_attention_fn(
+                    y_local = distributed_prepared_attention_fn(
                         q_local,
-                        k_local,
-                        v_local,
+                        k_prepared,
+                        v_prepared,
                         seq_lens[batch_idx:batch_idx + 1],
                         window_size=self.window_size,
                         softmax_scale=scale)
@@ -450,7 +463,7 @@ class WanSelfAttention(nn.Module):
                         0, :crop_len].view(
                             f, cy1 - cy0, cx1 - cx0,
                             self.num_heads, self.head_dim)
-                    del q_local, k_local, y_local, gathered_y
+                    del q_local, k_prepared, y_local, gathered_y
 
                     y_inner = y_crop[:, iy0:iy1, ix0:ix1]
                     core_frame = torch.arange(
@@ -476,10 +489,11 @@ class WanSelfAttention(nn.Module):
                         owned_output = y_inner.reshape(
                             -1, self.num_heads,
                             self.head_dim)[output_owned]
-                        canvas[local_output_idx] = owned_output
+                        canvas[local_output_idx] = owned_output.to(
+                            dtype=canvas.dtype)
                     del y_crop, y_inner
 
-                del k_local_raw, v_local
+                del k_prepared_raw, v_prepared
             return out
 
         tile_world_size = (
@@ -604,7 +618,8 @@ class WanSelfAttention(nn.Module):
                     del global_k_flat
 
                     y_inner = y_crop[:, iy0:iy1, ix0:ix1]
-                    canvas[:, y0:y1, x0:x1] = y_inner
+                    canvas[:, y0:y1, x0:x1] = y_inner.to(
+                        dtype=canvas.dtype)
 
             if tile_world_size > 1:
                 dist.all_reduce(canvas, op=dist.ReduceOp.SUM)

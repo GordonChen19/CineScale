@@ -1,10 +1,12 @@
 import argparse
 import copy
 import gc
+import json
 import logging
 import math
 import os
 import random
+import re
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -121,6 +123,30 @@ def make_model_config(wan_configs):
 def parse_size(size):
     width, height = size.lower().split("*")
     return int(width), int(height)
+
+
+def load_prompts(path):
+    with Path(path).open(encoding="utf-8") as handle:
+        data = json.load(handle)
+    prompts = data.get("prompts") if isinstance(data, dict) else None
+    if not isinstance(prompts, list) or not prompts:
+        raise ValueError(
+            f"{path} must contain a non-empty 'prompts' list.")
+    if not all(isinstance(prompt, str) and prompt.strip()
+               for prompt in prompts):
+        raise ValueError("Every entry in 'prompts' must be a non-empty string.")
+    return prompts
+
+
+def prompt_output_name(prompt, used_names):
+    prefix = prompt[:30].strip()
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", prefix).strip("._-")
+    stem = stem or "prompt"
+    count = used_names.get(stem, 0)
+    used_names[stem] = count + 1
+    if count:
+        stem = f"{stem}_{count + 1:02d}"
+    return f"{stem}.pt"
 
 
 def best_latent_size(width, height, max_area, vae_stride, patch_size):
@@ -289,14 +315,17 @@ def move_scheduler_to_device(scheduler, device):
 
 
 def set_block_tiled_self_attention(model, enabled, tile_height, tile_width,
-                                   global_rope_threshold):
+                                   global_rope_threshold_y,
+                                   global_rope_threshold_x):
     if enabled and min(tile_height, tile_width) <= 0:
         raise ValueError(
             "Block tiled self-attention tile must be positive."
         )
-    if enabled and global_rope_threshold < 0:
+    if enabled and min(global_rope_threshold_y,
+                       global_rope_threshold_x) < 0:
         raise ValueError(
-            "--block_tiled_self_attn_global_rope_threshold must be non-negative."
+            "Block tiled self-attention global RoPE thresholds must be "
+            "non-negative."
         )
     def set_model_block_tiling(wan_model):
         target_model = getattr(wan_model, "module", wan_model)
@@ -304,8 +333,10 @@ def set_block_tiled_self_attention(model, enabled, tile_height, tile_width,
             block.self_attn.block_tiled_attn_enabled = enabled
             block.self_attn.block_tiled_attn_tile_h = tile_height
             block.self_attn.block_tiled_attn_tile_w = tile_width
-            block.self_attn.block_tiled_attn_global_rope_threshold = (
-                global_rope_threshold)
+            block.self_attn.block_tiled_attn_global_rope_threshold_y = (
+                global_rope_threshold_y)
+            block.self_attn.block_tiled_attn_global_rope_threshold_x = (
+                global_rope_threshold_x)
 
     for _, dit_model in unique_dit_models(model):
         set_model_block_tiling(dit_model)
@@ -380,27 +411,6 @@ def resize_latent_to_size(model, latent, reference_size, target_size):
         "size": f"{decoded_width}*{decoded_height}",
         "latent_shape": tuple(resized.shape),
     }
-
-
-def resize_latent_input_to_size(model, latent, target_size):
-    source_height = latent.shape[-2] * model.vae_stride[1]
-    source_width = latent.shape[-1] * model.vae_stride[2]
-    return resize_latent_to_size(
-        model,
-        latent,
-        f"{source_width}*{source_height}",
-        target_size)
-
-
-def load_input_latent(path, latent_key="prompt_base_latent"):
-    latent, metadata = load_latent_payload(path, latent_key)
-    if not isinstance(latent, torch.Tensor):
-        raise TypeError(f"{path} did not resolve to a latent tensor.")
-    if latent.ndim != 4:
-        raise ValueError(
-            f"Expected latent tensor with shape [C, T, H, W], got {tuple(latent.shape)}."
-        )
-    return latent.float(), metadata
 
 
 def create_prompt_noise_latent(model, size, frame_num):
@@ -648,7 +658,8 @@ def load_latent_payload(path, latent_key="final_latent"):
     if isinstance(payload, torch.Tensor):
         if latent_key not in ("tensor", "final_latent"):
             raise KeyError(
-                f"{path} is a raw tensor, so --decode_latent_key must be 'tensor' or 'final_latent'.")
+                f"{path} is a raw tensor and cannot provide latent key "
+                f"'{latent_key}'.")
         return payload, {}
     metadata = dict(payload.get("metadata", {}))
 
@@ -674,9 +685,6 @@ def load_latent_payload(path, latent_key="final_latent"):
 
 
 def decode_latent_only(args, cfg):
-    if args.save_video is None:
-        raise ValueError("--decode_latent requires --save_video.")
-
     rank = int(os.getenv("RANK", "0"))
     local_rank = int(os.getenv("LOCAL_RANK", args.device_id))
     if rank != 0:
@@ -686,8 +694,10 @@ def decode_latent_only(args, cfg):
 
     from wan.modules.vae2_1 import Wan2_1_VAE
 
-    latent, metadata = load_latent_payload(args.decode_latent,
-                                           args.decode_latent_key)
+    latent_path = Path(args.decode_latent)
+    output_path = latent_path.with_suffix(".mp4")
+    latent, metadata = load_latent_payload(
+        latent_path, args.decode_latent_key)
     fps = metadata.get("fps", args.fps)
     vae_dtype = parse_torch_dtype(args.vae_dtype)
     vae = Wan2_1_VAE(
@@ -698,22 +708,14 @@ def decode_latent_only(args, cfg):
     if metadata.get("decoded_latent_key") == "prompt_base_latent":
         with torch.no_grad():
             video = vae.decode([latent.to(vae.device)])[0]
-        save_video_tensor(video, args.save_video, fps)
+        save_video_tensor(video, output_path, fps)
     else:
-        save_latent_video_tiled(vae, latent, args.save_video, fps)
+        save_latent_video_tiled(vae, latent, output_path, fps)
 
-    
-    logging.info("Decoded %s:%s to %s", args.decode_latent,
-                 metadata.get("decoded_latent_key", args.decode_latent_key),
-                 args.save_video)
+    print(f"Saved video as {output_path}", flush=True)
 
 
-def run(args, model, cfg):
-    if args.video is None and args.prompt is None:
-        raise ValueError(
-            "--prompt is required when --video is not provided.")
-    if args.prompt is None:
-        raise ValueError("--prompt is required unless --decode_latent is set.")
+def run(args, model, cfg, prompt, output_latent, prompt_index):
 
     frame_num = args.frame_num or cfg.frame_num
     sample_steps = args.sample_steps or cfg.sample_steps
@@ -728,15 +730,24 @@ def run(args, model, cfg):
         raise ValueError("--frame_num must be 4n+1 for Wan T2V.")
    
     encode_size = args.size
+    global_rope_threshold_y = (
+        args.block_tiled_self_attn_global_rope_threshold_vertical
+        if args.block_tiled_self_attn_global_rope_threshold_vertical
+        is not None else args.block_tiled_self_attn_global_rope_threshold)
+    global_rope_threshold_x = (
+        args.block_tiled_self_attn_global_rope_threshold_horizontal
+        if args.block_tiled_self_attn_global_rope_threshold_horizontal
+        is not None else args.block_tiled_self_attn_global_rope_threshold)
 
     context = context_null = None
     restart_scheduler = restart_timesteps = restart_sigmas = None
    
-    context, context_null = prepare_text_context(model, args.prompt,
-                                                        args.negative_prompt,
-                                                        text_offload_model)
+    context, context_null = prepare_text_context(
+        model, prompt, args.negative_prompt, text_offload_model)
     restart_scheduler, restart_timesteps, restart_sigmas = make_dpmpp_scheduler(
         model, sample_steps, sample_shift)
+    if args.offload_model and (args.t5_fsdp or args.dit_fsdp):
+        onload_dit_models(model)
 
     def configure_block_tiled_attention(enabled):
         set_block_tiled_self_attention(
@@ -744,100 +755,60 @@ def run(args, model, cfg):
             enabled,
             args.block_tiled_self_attn_tile_height,
             args.block_tiled_self_attn_tile_width,
-            args.block_tiled_self_attn_global_rope_threshold)
+            global_rope_threshold_y,
+            global_rope_threshold_x)
 
-    prompt_base_latent_cpu = None
-    if args.video is None:
-        prompt_base_size = "1280*720"
-        base_latent, base_seq_len, _ = create_prompt_noise_latent(
-            model, prompt_base_size, frame_num)
-        if is_main_process():
-            logging.info("Generating prompt-only base latent at %s",
-                         prompt_base_size)
-        base_scheduler, base_timesteps, base_sigmas = make_unipc_scheduler(
-            model, sample_steps, sample_shift)
-        configure_block_tiled_attention_for_base = False
-        set_block_tiled_self_attention(
-            model,
-            configure_block_tiled_attention_for_base,
-            args.block_tiled_self_attn_tile_height,
-            args.block_tiled_self_attn_tile_width,
-            args.block_tiled_self_attn_global_rope_threshold)
-        base_latent, _ = denoise_trajectory(
-            model=model,
-            start_latent=base_latent,
-            context=context,
-            context_null=context_null,
-            seq_len=base_seq_len,
-            scheduler=base_scheduler,
-            timesteps=base_timesteps,
-            sigmas=base_sigmas,
-            sample_steps=sample_steps,
-            start_index=0,
-            guide_scale=guide_scale,
-            offload_model=step_offload_model,
-            y=None)
-        del base_scheduler, base_timesteps, base_sigmas
-        if args.save_latent is not None and is_main_process():
-            prompt_base_latent_cpu = base_latent.detach().cpu()
-            prompt_base_payload = {
-                "final_latent": None,
-                "prompt_base_latent": prompt_base_latent_cpu,
-                "metadata": {"fps": args.fps},
-            }
-            Path(args.save_latent).parent.mkdir(parents=True, exist_ok=True)
-            torch.save(prompt_base_payload, args.save_latent)
-            logging.info("Immediately saved 720p prompt base latent to %s",
-                         args.save_latent)
-
-        clean_latent, resize_metadata = resize_latent_to_size(
-            model, base_latent, prompt_base_size, encode_size)
-        seq_len = compute_seq_len(model, clean_latent.shape)
-        metadata = {
-            **resize_metadata,
-            "prompt_base_size": prompt_base_size,
-            "prompt_base_latent_shape": tuple(base_latent.shape),
-            "input_resize_mode": "latent",
-            "input_frame_count": frame_num,
-        }
-        del base_latent
-        metadata["input_mode"] = "prompt"
-    else:
-        source_latent, source_metadata = load_input_latent(args.video)
-        clean_latent, resize_metadata = resize_latent_input_to_size(
-            model, source_latent, encode_size)
-        seq_len = compute_seq_len(model, clean_latent.shape)
-        source_size = (
-            f"{source_latent.shape[-1] * model.vae_stride[2]}*"
-            f"{source_latent.shape[-2] * model.vae_stride[1]}")
-        metadata = {
-            **resize_metadata,
-            "input_mode": "latent",
-            "input_latent": args.video,
-            "input_latent_key": source_metadata.get("decoded_latent_key",
-                                                    "prompt_base_latent"),
-            "input_latent_shape": tuple(source_latent.shape),
-            "input_latent_size": source_size,
-            "input_resize_mode": "latent",
-            "input_frame_count": (
-                (source_latent.shape[1] - 1) * model.vae_stride[0] + 1),
-        }
-        del source_latent
+    prompt_base_size = "1280*720"
+    base_latent, base_seq_len, _ = create_prompt_noise_latent(
+        model, prompt_base_size, frame_num)
     if is_main_process():
-        if args.video is None:
-            logging.info("Generated prompt base at %s, then latent-resized to %s",
-                         metadata["prompt_base_size"],
-                         metadata["size"])
-        else:
-            logging.info("Loaded latent %s at %s, then latent-resized to %s",
-                         args.video, metadata["input_latent_size"],
-                         metadata["size"])
+        logging.info("Generating prompt-conditioned base latent at %s",
+                     prompt_base_size)
+    base_scheduler, base_timesteps, base_sigmas = make_unipc_scheduler(
+        model, sample_steps, sample_shift)
+    set_block_tiled_self_attention(
+        model,
+        False,
+        args.block_tiled_self_attn_tile_height,
+        args.block_tiled_self_attn_tile_width,
+        global_rope_threshold_y,
+        global_rope_threshold_x)
+    base_latent, _ = denoise_trajectory(
+        model=model,
+        start_latent=base_latent,
+        context=context,
+        context_null=context_null,
+        seq_len=base_seq_len,
+        scheduler=base_scheduler,
+        timesteps=base_timesteps,
+        sigmas=base_sigmas,
+        sample_steps=sample_steps,
+        start_index=0,
+        guide_scale=guide_scale,
+        offload_model=step_offload_model,
+        y=None)
+    del base_scheduler, base_timesteps, base_sigmas
+    prompt_base_latent_cpu = (
+        base_latent.detach().cpu() if is_main_process() else None)
+
+    clean_latent, resize_metadata = resize_latent_to_size(
+        model, base_latent, prompt_base_size, encode_size)
+    seq_len = compute_seq_len(model, clean_latent.shape)
+    metadata = {
+        **resize_metadata,
+        "input_mode": "prompt",
+        "prompt_base_size": prompt_base_size,
+        "prompt_base_latent_shape": tuple(base_latent.shape),
+        "input_resize_mode": "latent",
+        "input_frame_count": frame_num,
+    }
+    del base_latent
+    if is_main_process():
+        logging.info("Generated prompt base at %s, then latent-resized to %s",
+                     metadata["prompt_base_size"], metadata["size"])
 
     if args.offload_model:
         offload_vae_model(model)
-
-    if args.offload_model and (args.t5_fsdp or args.dit_fsdp):
-        onload_dit_models(model)
 
     configure_block_tiled_attention(args.block_tiled_self_attn)
 
@@ -869,23 +840,21 @@ def run(args, model, cfg):
     if args.offload_model:  
         offload_dit_models(model)
 
-    if args.save_latent is not None and is_main_process():
+    if is_main_process():
         payload = {
             "final_latent": final_latent.detach().cpu(),
             "prompt_base_latent": prompt_base_latent_cpu,
-            "metadata": {"fps": args.fps},
+            "metadata": {
+                **metadata,
+                "fps": args.fps,
+                "prompt": prompt,
+                "prompt_index": prompt_index,
+                "run_seed": args.run_seed,
+            },
         }
-        Path(args.save_latent).parent.mkdir(parents=True, exist_ok=True)
-        torch.save(payload, args.save_latent)
-        logging.info("Saved latent to %s", args.save_latent)
-
-    if args.save_video is not None and is_main_process():
-        Path(args.save_video).parent.mkdir(parents=True, exist_ok=True)
-        model.vae.model.to(device=model.vae.device, dtype=model.vae.dtype)
-        save_latent_video_tiled(model.vae, final_latent, args.save_video,
-                                    args.fps)
-        
-        logging.info("Decoded final latent to %s", args.save_video)
+        output_latent.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(payload, output_latent)
+        print(f"Saved video as {output_latent}", flush=True)
 
     del clean_latent, context, context_null
     del restart_scheduler, restart_timesteps, restart_sigmas
@@ -894,28 +863,28 @@ def run(args, model, cfg):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Wan2.2 T2V video upscaling with noise-based denoising experiments."
+        description="Run Wan2.2 CineScale for every prompt in a JSON file."
     )
     parser.add_argument(
-        "--video",
-        default=None,
-        help="Optional input latent .pt path. If omitted, a 1280*720 prompt-only latent is generated first and then latent-resized to --size.")
-    parser.add_argument("--prompt", default=None, help="T2V prompt.")
+        "--prompts_json",
+        default=str(ROOT / "prompts.json"),
+        help="JSON file containing a top-level 'prompts' list.")
+    parser.add_argument(
+        "--output_dir",
+        default="CineScale/batch_latents",
+        help="Directory for prompt-named latent .pt outputs.")
     parser.add_argument(
         "--ckpt_dir",
         required=True,
         help="Wan2.2-T2V-A14B checkpoint directory.")
-    
-    parser.add_argument("--save_video", default=None, help="Optional decoded output mp4 path.")
-    parser.add_argument("--save_latent", default=None, help="Optional final latent .pt path.")
     parser.add_argument(
         "--decode_latent",
         default=None,
-        help="Decode this saved latent .pt and exit without loading DiT/T5.")
+        help="Decode this saved latent .pt to a same-named .mp4 and exit.")
     parser.add_argument(
         "--decode_latent_key",
         default="final_latent",
-        help="Which tensor to decode from a saved latent .pt: final_latent, prompt_base_latent.")
+        help="Tensor to decode from the saved .pt, such as final_latent or prompt_base_latent.")
     parser.add_argument(
         "--vae_dtype",
         default="fp16",
@@ -947,10 +916,25 @@ def parse_args():
         default=20,
         help="Inner self-attention tile width in transformer patch-token units.")
     parser.add_argument(
+        "--block_tiled_self_attn_tile_height",
+        type=int,
+        default=20,
+        help="Inner self-attention tile height in transformer patch-token units.")
+    parser.add_argument(
         "--block_tiled_self_attn_global_rope_threshold",
         type=float,
         default=20.0,
-        help="Uncompressed local distance threshold before geometry-derived compressed-relative global RoPE.")
+        help="Fallback threshold for both axes. Axis-specific options override it.")
+    parser.add_argument(
+        "--block_tiled_self_attn_global_rope_threshold_horizontal",
+        type=float,
+        default=None,
+        help="Horizontal uncompressed distance threshold in transformer patch-token units.")
+    parser.add_argument(
+        "--block_tiled_self_attn_global_rope_threshold_vertical",
+        type=float,
+        default=None,
+        help="Vertical uncompressed distance threshold in transformer patch-token units.")
     parser.add_argument("--base_seed", type=int, default=-1)
     parser.add_argument("--device_id", type=int, default=0)
     parser.add_argument("--rank", type=int, default=0)
@@ -989,6 +973,7 @@ def main():
     if args.decode_latent is not None:
         decode_latent_only(args, cfg)
         return
+    prompts = load_prompts(args.prompts_json)
 
     rank, world_size, _ = setup_distributed(args)
 
@@ -1028,7 +1013,29 @@ def main():
     model.model_version = "2.2"
 
     set_vae_dtype(model.vae, parse_torch_dtype(args.vae_dtype))
-    run(args, model, cfg)
+    output_dir = Path(args.output_dir)
+    if is_main_process():
+        output_dir.mkdir(parents=True, exist_ok=True)
+        logging.info("Loaded %d prompts from %s", len(prompts),
+                     args.prompts_json)
+    if dist.is_initialized():
+        dist.barrier()
+
+    used_names = {}
+    for prompt_index, prompt in enumerate(prompts):
+        output_latent = output_dir / prompt_output_name(prompt, used_names)
+        if is_main_process():
+            logging.info("Running prompt %d/%d: %s", prompt_index + 1,
+                         len(prompts), prompt[:80])
+        run(
+            args,
+            model,
+            cfg,
+            prompt,
+            output_latent,
+            prompt_index)
+        if dist.is_initialized():
+            dist.barrier()
 
     if dist.is_initialized():
         dist.barrier()
@@ -1038,35 +1045,27 @@ def main():
 if __name__ == "__main__":
     main()
 
-
-# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-# python CineScale/Wan2.2/cinescale.py \
-#   --decode_latent CineScale/latent_result.pt \
-#   --ckpt_dir Wan2.2-T2V-A14B \
-#   --decode_latent_key prompt_base_latent \
-#   --save_video CineScale/base_result.mp4  
-
-# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-# python CineScale/Wan2.2/cinescale.py \
-#   --decode_latent CineScale/4k_result.pt \
-#   --ckpt_dir Wan2.2-T2V-A14B \
-#   --save_video CineScale/result.mp4  
-
-# CUDA_VISIBLE_DEVICES=0,1,2,3 \
 # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-# torchrun --standalone --nproc_per_node=4 CineScale/Wan2.2/cinescale.py \
-#   --video CineScale/4k_result.pt \
-#   --size "3840*2160" \
-#   --prompt "Dusk time, soft lighting, side lighting, low contrast lighting, medium long shot, balanced composition, warm colors, two shot, daylight.A graceful Mongolian woman is performing the **bowl dance** on a vast grassland. She is wearing a bright red Mongolian robe embroidered with cloud and floral patterns, a wide silk sash at her waist, and a traditional hat with an exquisite headdress, her expression focused. As the camera moves to the left, she balances six porcelain bowls stacked on her head. Her steps are steady, and her arms sway like waves as she performs soft arm and shoulder shake movements. Simultaneously, she executes backbends, spins, and small jumps with movements that are both elegant and powerful. The background is a vast grassland with several yurts, and golden sunlight falls on the scene, creating a warm and magnificent atmosphere." \
+# python CineScale/Wan2.2/cinescale.py \
+#   --decode_latent CineScale/example_videos/The_video_depicts_golden_hour.pt \
+#   --decode_latent_key final_latent \
+#   --ckpt_dir Wan2.2-T2V-A14B
+
+
+# CUDA_VISIBLE_DEVICES=0,2,3,4,5 \
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+# torchrun --standalone --nproc_per_node=5 CineScale/Wan2.2/cinescale.py \
+#   --prompts_json CineScale/Wan2.2/prompts_2.json \
+#   --output_dir CineScale/example_videos \
 #   --ckpt_dir Wan2.2-T2V-A14B \
 #   --frame_num 41 \
-#   --round_noise_steps 20 \
-#   --sample_shift 12 \
-#   --block_tiled_self_attn_tile_width 30 \
-#   --block_tiled_self_attn_stride_height 20 \
-#   --block_tiled_self_attn_global_rope_threshold 10 \
-#   --save_latent CineScale/4k_result.pt \
-#   --ulysses_size 4 \
+#   --round_noise_steps 25 \
+#   --block_tiled_self_attn_tile_width 32 \
+#   --block_tiled_self_attn_tile_height 18 \
+#   --block_tiled_self_attn_global_rope_threshold_horizontal 16 \
+#   --block_tiled_self_attn_global_rope_threshold_vertical 9 \
+#   --ulysses_size 5 \
 #   --dit_fsdp \
 #   --t5_cpu \
-#   --offload_model true 
+#   --offload_model true \
+#  2>&1 | tee CineScale/example_videos/run_2.log

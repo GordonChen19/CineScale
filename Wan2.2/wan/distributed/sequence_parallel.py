@@ -5,7 +5,9 @@ import math
 from torch.utils.checkpoint import checkpoint
 
 from ..modules.model import sinusoidal_embedding_1d
-from .ulysses import distributed_attention
+from .ulysses import (distributed_attention,
+                      distributed_attention_with_prepared_kv,
+                      prepare_kv_for_distributed_attention)
 from .util import gather_forward, get_rank, get_world_size
 
 
@@ -176,15 +178,16 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
         return q, k, v
 
     if getattr(self, "block_tiled_attn_enabled", False):
-        # Process every tile collectively. K/V remain sequence-sharded and
-        # Ulysses performs the global softmax without gathering full-resolution
-        # hidden, K, V, or output tensors on every rank.
+        # Prepare global head-sharded K/V once per block. Each tile then
+        # exchanges only Q/output while applying its own rectified RoPE to K.
         x = self.block_tiled_self_attention(
             seq_lens=seq_lens,
             grid_sizes=grid_sizes,
             freqs=freqs,
             hidden_states=x,
-            distributed_attention_fn=distributed_attention,
+            distributed_kv_prepare_fn=prepare_kv_for_distributed_attention,
+            distributed_prepared_attention_fn=(
+                distributed_attention_with_prepared_kv),
             sequence_rank=get_rank(),
             sequence_world_size=get_world_size())
     else:

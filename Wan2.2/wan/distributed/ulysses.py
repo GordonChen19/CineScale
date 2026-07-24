@@ -6,6 +6,39 @@ from ..modules.attention import flash_attention
 from .util import all_to_all
 
 
+def prepare_kv_for_distributed_attention(k, v):
+    """Move sequence-sharded K/V into Ulysses head-sharded layout once."""
+    if not dist.is_initialized():
+        raise ValueError("distributed group should be initialized.")
+    k = all_to_all(k, scatter_dim=2, gather_dim=1)
+    v = all_to_all(v, scatter_dim=2, gather_dim=1)
+    return k, v
+
+
+def distributed_attention_with_prepared_kv(
+        q,
+        k,
+        v,
+        seq_lens,
+        window_size=(-1, -1),
+        softmax_scale=None,
+):
+    """Run Ulysses attention with K/V already in head-sharded layout."""
+    if not dist.is_initialized():
+        raise ValueError("distributed group should be initialized.")
+
+    q = all_to_all(q, scatter_dim=2, gather_dim=1)
+    x = flash_attention(
+        q,
+        k,
+        v,
+        k_lens=seq_lens,
+        softmax_scale=softmax_scale,
+        window_size=window_size,
+    )
+    return all_to_all(x, scatter_dim=1, gather_dim=2)
+
+
 def distributed_attention(
         q,
         k,
@@ -27,23 +60,13 @@ def distributed_attention(
     """
     if not dist.is_initialized():
         raise ValueError("distributed group should be initialized.")
-    b = q.shape[0]
 
-    # gather q/k/v sequence
-    q = all_to_all(q, scatter_dim=2, gather_dim=1)
-    k = all_to_all(k, scatter_dim=2, gather_dim=1)
-    v = all_to_all(v, scatter_dim=2, gather_dim=1)
-
-    # apply attention
-    x = flash_attention(
+    k, v = prepare_kv_for_distributed_attention(k, v)
+    return distributed_attention_with_prepared_kv(
         q,
         k,
         v,
-        k_lens=seq_lens,
+        seq_lens,
         softmax_scale=softmax_scale,
         window_size=window_size,
     )
-
-    # scatter q/k/v sequence
-    x = all_to_all(x, scatter_dim=1, gather_dim=2)
-    return x
